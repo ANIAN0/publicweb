@@ -39,3 +39,37 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Eve 开发运行时（dev-runtime 快照根目录）
+/.eve/
+
+# DNS 覆盖配置（本地开发工具）
+.dns-override.cjs
+
+# SQLite 数据库文件（Drizzle ORM 数据存储）
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Drizzle 迁移元数据（自动生成的快照，不应手动提交）
+/drizzle/meta/
+
+# Windows 系统文件
+Thumbs.db
+ehthumbs.db
+ehthumbs_view.db
+Desktop.ini
+
+# IDE 编辑器配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+
+# 临时文件与缓存
+*.tmp
+*.temp
+.cache/

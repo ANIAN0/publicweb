@@ -24,6 +24,16 @@ CREATE TABLE `devices` (
 	`created_at` integer NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE `eve_services` (
+	`id` text PRIMARY KEY NOT NULL,
+	`name` text NOT NULL,
+	`host` text NOT NULL,
+	`model` text NOT NULL,
+	`online` integer DEFAULT false,
+	`last_seen_at` integer,
+	`created_at` integer NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE `messages` (
 	`id` text PRIMARY KEY NOT NULL,
 	`session_id` text NOT NULL,
@@ -32,15 +42,17 @@ CREATE TABLE `messages` (
 	`content` text DEFAULT '' NOT NULL,
 	`tool_calls` text,
 	`tool_results` text,
+	`reasoning` text,
 	`finish_reason` text,
 	`created_at` integer NOT NULL,
 	FOREIGN KEY (`session_id`) REFERENCES `sessions`(`id`) ON UPDATE no action ON DELETE no action
 );
 --> statement-breakpoint
+CREATE UNIQUE INDEX `messages_session_seq_unique` ON `messages` (`session_id`,`seq`);--> statement-breakpoint
 CREATE TABLE `sessions` (
 	`id` text PRIMARY KEY NOT NULL,
 	`backend` text NOT NULL,
-	`device_id` text,
+	`target_id` text NOT NULL,
 	`model` text NOT NULL,
 	`title` text,
 	`user_title` text,
@@ -49,8 +61,7 @@ CREATE TABLE `sessions` (
 	`local_session_ref` text,
 	`created_at` integer NOT NULL,
 	`last_active_at` integer NOT NULL,
-	`deleted_at` integer,
-	FOREIGN KEY (`device_id`) REFERENCES `devices`(`id`) ON UPDATE no action ON DELETE no action
+	`deleted_at` integer
 );
 --> statement-breakpoint
 CREATE TABLE `setup_tokens` (

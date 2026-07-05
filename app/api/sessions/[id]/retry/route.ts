@@ -32,15 +32,14 @@ export async function POST(
     .filter((r) => r.role === 'user' || r.role === 'assistant')
     .map((r) => ({ role: r.role as 'user' | 'assistant', content: r.content }));
 
-  // 调对应 adapter.startSession：device 上线时此调用把 session.start 派发给 client
+  // 调对应 adapter.startSession:targetId 多态(local=device.id 派发 WS,eveagent=eve_service.id 选 host)
   const adapter = getBackendAdapter(session.backend);
   try {
     await adapter.startSession({
       sessionId: id,
       model: session.model,
+      targetId: session.targetId,
       history,
-      ...(session.deviceId ? { deviceId: session.deviceId } : {}),
-      ...((session.backend === 'claudecode' || session.backend === 'pi') ? { backend: session.backend } : {}),
     });
   } catch (err: any) {
     // device 离线等情况下 LocalBackend.startSession 会抛错；返回 503 让前端能识别

@@ -31,10 +31,25 @@ export const setupTokens = sqliteTable('setup_tokens', {
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
+// eve 服务端点(与 devices 对称):eveagent 后端的执行端点。
+// 一个 eve 部署 = 一个 root agent = 一个 model(部署时 agent.ts 写死),
+// 所以 model 列存该服务绑定的模型。eve info() 需 auth 拉不到,由部署者添加服务时填。
+export const eveServices = sqliteTable('eve_services', {
+  id: text('id').primaryKey(),                                  // ulid
+  name: text('name').notNull(),                                 // 展示名 "云端 eve"
+  host: text('host').notNull(),                                 // https://hunian003-evework.hf.space
+  model: text('model').notNull(),                               // 该服务绑定的模型(部署者填)
+  online: integer('online', { mode: 'boolean' }).default(false),
+  lastSeenAt: integer('last_seen_at', { mode: 'timestamp' }),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+});
+
 export const sessions = sqliteTable('sessions', {
   id: text('id').primaryKey(),                                 // ulid
   backend: text('backend').notNull(),                           // 'eveagent' | 'claudecode' | 'pi'
-  deviceId: text('device_id').references(() => devices.id),     // null for eveagent
+  // 多态执行端点 id:local 存 device.id,eveagent 存 eve_service.id,由适配器解释。
+  // 去外键因 target 多态;每个 session 都必须绑定一个 target。
+  targetId: text('target_id').notNull(),
   model: text('model').notNull(),
   title: text('title'),                                        // 自动标题（首条用户消息前 30 字）
   userTitle: text('user_title'),                                // 用户自定义，覆盖 title

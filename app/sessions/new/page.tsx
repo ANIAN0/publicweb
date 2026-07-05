@@ -2,82 +2,104 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Spinner } from '@/components/ui/spinner';
+import { cn } from '@/lib/utils';
+import type { ComponentType } from 'react';
+import { Cloud, Terminal, Code, ArrowLeft, Check } from 'lucide-react';
 
-interface Device {
+interface BackendDescriptor { id: string; label: string; description: string }
+interface ModelInfo { id: string; label: string; isDefault?: boolean }
+interface ExecutionTarget {
   id: string;
   name: string;
-  hostname?: string;
   online: boolean;
-  supportedBackends: string[];
+  models: ModelInfo[];
+  meta?: Record<string, string>;
 }
 
-interface ModelInfo { id: string; label: string; isDefault?: boolean }
+// 步骤:后端 → 端点 → 模型。模型步按 target.models 数量决定是否显示(单模型自动跳过选择)。
+// 所有后端走同一条代码路径,差异在适配器返回的 target.models 数量,不按 backend 名分叉。
+const STEPS = [
+  { key: 'backend', label: '后端' },
+  { key: 'target', label: '端点' },
+  { key: 'model', label: '模型' },
+] as const;
 
-// 3 步向导：后端卡片 → 设备选择（仅 claudecode/pi）→ 模型选择
-// T-004 范围：加 claudecode 卡片 + 设备选择；完整的多设备新会话向导在 T-006
+// 后端图标映射(展示层,非逻辑分叉)
+const BACKEND_ICONS: Record<string, ComponentType<{ className?: string }>> = {
+  eveagent: Cloud,
+  claudecode: Terminal,
+  pi: Code,
+};
+
 export default function NewSession() {
   const router = useRouter();
-  const [step, setStep] = useState<'backend' | 'device' | 'model'>('backend');
+  const [step, setStep] = useState<'backend' | 'target' | 'model'>('backend');
+  const [backends, setBackends] = useState<BackendDescriptor[]>([]);
   const [backend, setBackend] = useState<string>('');
-  const [deviceId, setDeviceId] = useState<string>('');
+  const [targets, setTargets] = useState<ExecutionTarget[]>([]);
+  const [targetId, setTargetId] = useState<string>('');
   const [model, setModel] = useState<string>('');
-  const [devices, setDevices] = useState<Device[]>([]);
-  const [models, setModels] = useState<ModelInfo[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string>('');
 
-  // 进入 device step 时拉设备
-  // 修复 REV-005-10：渲染所有支持该后端的设备；离线项置灰且不可选（F-011 验收）。
-  // 跳过 Step 2 仅当"有且仅有一台在线支持设备"才成立。
+  const currentIndex = STEPS.findIndex((s) => s.key === step);
+  const selectedTarget = targets.find((t) => t.id === targetId);
+
+  // 拉后端列表(数据驱动,不硬编码 3 张卡片)
   useEffect(() => {
-    if (step !== 'device') return;
-    fetch('/api/devices')
-      .then((r) => r.json())
-      .then((data: Device[]) => {
-        const supporting = data.filter((d) => d.supportedBackends.includes(backend));
-        setDevices(supporting);
-        const onlineOnes = supporting.filter((d) => d.online);
-        if (onlineOnes.length === 1) {
-          // 唯一在线支持设备：跳过选择
-          setDeviceId(onlineOnes[0].id);
-          setStep('model');
+    fetch('/api/backends').then((r) => r.json()).then((b: BackendDescriptor[]) => setBackends(b));
+  }, []);
+
+  // 选后端后拉端点列表(适配器返回,local=设备,eveagent=eve 服务)
+  useEffect(() => {
+    if (step !== 'target' || !backend) return;
+    fetch(`/api/backends/${backend}/targets`).then((r) => r.json()).then((t: ExecutionTarget[]) => {
+      setTargets(t);
+      // 唯一在线端点:自动选中 + 同步选 model(单模型端点步直接可创建,多模型进模型步可改)
+      const onlineOnes = t.filter((x) => x.online);
+      if (onlineOnes.length === 1) {
+        const only = onlineOnes[0];
+        setTargetId(only.id);
+        if (only.models.length >= 1) {
+          const def = only.models.find((m) => m.isDefault) ?? only.models[0];
+          setModel(def.id);
         }
-      });
+      }
+    });
   }, [step, backend]);
 
-  // 进入 model step 时拉模型
-  useEffect(() => {
-    if (step !== 'model' || !deviceId || !backend) return;
-    fetch(`/api/devices/${deviceId}/models`)
-      .then((r) => r.json())
-      .then((rows: { backend: string; models: ModelInfo[] }[]) => {
-        const row = rows.find((r) => r.backend === backend);
-        setModels(row?.models ?? []);
-        // 默认选 default 或第一项
-        if (row?.models) {
-          const def = row.models.find((m) => m.isDefault) ?? row.models[0];
-          if (def) setModel(def.id);
-        }
-      });
-  }, [step, deviceId, backend]);
+  // 选端点:同步选 model(单模型自动选默认;多模型选默认作为初值,模型步可改)。
+  // 关键:不在此处跳步——是否进模型步由端点步底部的"下一步"按钮决定(仅多模型显示)。
+  // 这样从模型步返回端点步时,不会因 targetId 仍在而被 effect 再次推进(死循环)。
+  const selectTarget = (id: string) => {
+    setTargetId(id);
+    const t = targets.find((x) => x.id === id);
+    if (t && t.models.length >= 1) {
+      const def = t.models.find((m) => m.isDefault) ?? t.models[0];
+      setModel(def.id);
+    } else {
+      setModel('');
+    }
+  };
 
   const handleCreate = async () => {
-    if (!backend || !model) return;
+    if (!backend || !targetId || !model) return;
     setSubmitting(true);
     setError('');
     try {
-      const body: Record<string, string> = { backend, model };
-      if (deviceId) body.deviceId = deviceId;
-      const response = await fetch('/api/sessions', {
+      const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ backend, targetId, model }),
       });
-      if (response.ok) {
-        const data = await response.json();
+      if (res.ok) {
+        const data = await res.json();
         router.push(`/sessions/${data.id}`);
       } else {
-        const err = await response.json();
+        const err = await res.json();
         setError(err.error ?? 'create failed');
       }
     } finally {
@@ -85,124 +107,191 @@ export default function NewSession() {
     }
   };
 
+  // 步骤条点回:只允许跳到当前及之前步骤
+  const goToStep = (key: 'backend' | 'target' | 'model') => {
+    const idx = STEPS.findIndex((s) => s.key === key);
+    if (idx <= currentIndex) setStep(key);
+  };
+
+  const handleBack = () => setStep(step === 'model' ? 'target' : 'backend');
+
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen p-8">
-      <h1 className="text-2xl font-bold mb-8">新建会话</h1>
-
-      {error && <div className="text-red-500 mb-4">{error}</div>}
-
-      {step === 'backend' && (
-        <div className="grid grid-cols-3 gap-4">
-          <BackendCard
-            title="Eveagent"
-            subtitle="远程云端 agent"
-            colorClass="border-blue-500 hover:bg-blue-50 dark:hover:bg-blue-950"
-            onClick={() => { setBackend('eveagent'); setStep('model'); }}
-          />
-          <BackendCard
-            title="Claude Code"
-            subtitle="本地 claudecode CLI"
-            colorClass="border-purple-500 hover:bg-purple-50 dark:hover:bg-purple-950"
-            onClick={() => { setBackend('claudecode'); setStep('device'); }}
-          />
-          <BackendCard
-            title="Pi"
-            subtitle="本地 pi CLI"
-            colorClass="border-green-500 hover:bg-green-50 dark:hover:bg-green-950"
-            onClick={() => { setBackend('pi'); setStep('device'); }}
-          />
+    <div className="flex min-h-screen flex-col items-center px-4 py-12">
+      <div className="w-full max-w-2xl">
+        {/* 标题区 */}
+        <div className="mb-8">
+          <h1 className="text-2xl font-bold">新建会话</h1>
+          <p className="mt-1 text-sm text-muted-foreground">选择后端、端点与模型,创建一个新会话</p>
         </div>
-      )}
 
-      {step === 'device' && (
-        <div className="w-full max-w-md">
-          <h2 className="text-lg mb-4">选择设备</h2>
-          {devices.length === 0 ? (
-            <div className="text-zinc-500">没有支持 {backend} 的设备，请先在
-              <a href="/devices" className="text-blue-500 mx-1">设备管理</a>添加
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {devices.map((d) => {
-                // 离线设备置灰且不可点（F-011 / REV-005-10）
-                const isOffline = !d.online;
-                return (
-                  <button
-                    key={d.id}
-                    onClick={() => { if (!isOffline) { setDeviceId(d.id); setStep('model'); } }}
-                    disabled={isOffline}
-                    aria-disabled={isOffline}
-                    className={`w-full text-left p-3 border rounded ${
-                      isOffline
-                        ? 'opacity-50 cursor-not-allowed bg-zinc-100 dark:bg-zinc-900'
-                        : 'hover:bg-zinc-100 dark:hover:bg-zinc-800'
-                    }`}
-                  >
-                    <div className="font-medium flex items-center gap-2">
-                      {d.name}
-                      {isOffline && <span className="text-xs text-zinc-500">(离线)</span>}
-                    </div>
-                    <div className="text-xs text-zinc-500">{d.hostname || '—'}</div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-          <button
-            onClick={() => setStep('backend')}
-            className="mt-4 text-sm text-zinc-500 hover:underline"
-          >← 返回</button>
-        </div>
-      )}
-
-      {step === 'model' && (
-        <div className="w-full max-w-md">
-          <h2 className="text-lg mb-4">选择模型</h2>
-          {models.length === 0 ? (
-            <div className="text-zinc-500">该设备未上报模型清单</div>
-          ) : (
-            <div className="space-y-2">
-              {models.map((m) => (
+        {/* 步骤条 */}
+        <div className="mb-8 flex items-center gap-2">
+          {STEPS.map((s, i) => {
+            const active = s.key === step;
+            const reached = i <= currentIndex;
+            return (
+              <div key={s.key} className="flex items-center gap-2">
                 <button
-                  key={m.id}
-                  onClick={() => setModel(m.id)}
-                  className={`w-full text-left p-3 border rounded ${
-                    model === m.id ? 'border-blue-500 bg-blue-50 dark:bg-blue-950' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800'
-                  }`}
+                  type="button"
+                  disabled={!reached}
+                  onClick={() => goToStep(s.key)}
+                  className={cn(
+                    'flex items-center gap-1.5 text-sm transition-colors',
+                    active ? 'text-foreground' : reached ? 'text-muted-foreground hover:text-foreground' : 'text-muted-foreground/40',
+                    !reached && 'cursor-not-allowed',
+                  )}
                 >
-                  {m.label || m.id}
-                  {m.isDefault && <span className="ml-2 text-xs text-zinc-500">default</span>}
+                  <span className={cn(
+                    'flex size-6 items-center justify-center rounded-full text-xs font-medium transition-colors',
+                    active ? 'bg-primary text-primary-foreground' : reached ? 'bg-muted text-muted-foreground' : 'bg-muted/50',
+                  )}>{i + 1}</span>
+                  {s.label}
                 </button>
-              ))}
-            </div>
-          )}
-          <div className="flex justify-between mt-4">
-            <button
-              onClick={() => setStep(backend === 'eveagent' ? 'backend' : 'device')}
-              className="text-sm text-zinc-500 hover:underline"
-            >← 返回</button>
-            <button
-              onClick={handleCreate}
-              disabled={!model || submitting}
-              className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:opacity-50"
-            >{submitting ? '创建中...' : '创建会话'}</button>
-          </div>
+                {i < STEPS.length - 1 && <div className="h-px w-8 bg-border" />}
+              </div>
+            );
+          })}
         </div>
-      )}
-    </div>
-  );
-}
 
-function BackendCard({ title, subtitle, colorClass, onClick }: {
-  title: string; subtitle: string; colorClass: string; onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`p-6 border-2 rounded-lg text-left ${colorClass}`}
-    >
-      <div className="text-lg font-semibold">{title}</div>
-      <div className="text-sm text-zinc-500 mt-1">{subtitle}</div>
-    </button>
+        {error && (
+          <div className="mb-4 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
+        )}
+
+        {/* Step 1: 后端 —— 从 /api/backends 拉取,数据驱动渲染 */}
+        {step === 'backend' && (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            {backends.map((b) => {
+              const Icon = BACKEND_ICONS[b.id] ?? Terminal;
+              return (
+                <Button
+                  key={b.id}
+                  variant="outline"
+                  onClick={() => {
+                    setBackend(b.id);
+                    // 重置下游选择,避免切后端时残留
+                    setTargetId('');
+                    setModel('');
+                    setTargets([]);
+                    setStep('target');
+                  }}
+                  className="h-auto flex-col items-start gap-2 p-4 text-left"
+                >
+                  <Icon className="size-6" />
+                  <div>
+                    <div className="font-medium">{b.label}</div>
+                    <div className="text-xs text-muted-foreground">{b.description}</div>
+                  </div>
+                </Button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Step 2: 端点 —— local=设备,eveagent=eve 服务;离线置灰;单模型端点显示模型徽标 */}
+        {step === 'target' && (
+          <div className="w-full">
+            <h2 className="mb-4 text-lg font-medium">选择端点</h2>
+            {targets.length === 0 ? (
+              <div className="text-sm text-muted-foreground">没有可用的端点</div>
+            ) : (
+              <div className="space-y-1">
+                {targets.map((t) => {
+                  const isOffline = !t.online;
+                  const selected = targetId === t.id;
+                  return (
+                    <button
+                      key={t.id}
+                      onClick={() => { if (!isOffline) selectTarget(t.id); }}
+                      disabled={isOffline}
+                      className={cn(
+                        'flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left ring-2 ring-transparent transition-colors',
+                        selected ? 'bg-accent ring-primary' : isOffline ? 'cursor-not-allowed opacity-50' : 'hover:bg-muted/50',
+                      )}
+                    >
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">{t.name}</span>
+                          {isOffline && <Badge variant="secondary">离线</Badge>}
+                          {/* 单模型端点(eveagent)直接在端点行显示模型;多模型在下一步选 */}
+                          {t.models.length === 1 && <Badge variant="outline">{t.models[0].label}</Badge>}
+                        </div>
+                        {/* meta 展示:设备 hostname 或 eve 服务 host */}
+                        {(t.meta?.hostname || t.meta?.host) && (
+                          <div className="mt-0.5 text-xs text-muted-foreground">{t.meta.hostname || t.meta.host}</div>
+                        )}
+                      </div>
+                      {selected && <Check className="size-4 text-primary" />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            <div className="mt-4 flex items-center justify-between">
+              <Button variant="ghost" size="sm" onClick={handleBack}>
+                <ArrowLeft />
+                返回
+              </Button>
+              {/* 单模型端点(eveagent):端点行已显示模型徽标,直接创建,无需进模型步 */}
+              {selectedTarget && selectedTarget.models.length === 1 && (
+                <Button onClick={handleCreate} disabled={submitting}>
+                  {submitting && <Spinner className="size-4" />}
+                  {submitting ? '创建中...' : '创建会话'}
+                </Button>
+              )}
+              {/* 多模型端点(local):进模型步选模型 */}
+              {selectedTarget && selectedTarget.models.length > 1 && (
+                <Button onClick={() => setStep('model')}>下一步</Button>
+              )}
+              {/* 零模型:无法创建,提示 */}
+              {selectedTarget && selectedTarget.models.length === 0 && (
+                <span className="text-sm text-muted-foreground">该端点未上报模型清单</span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Step 3: 模型 —— 单模型自动选中(展示用),多模型让选;零模型提示 */}
+        {step === 'model' && (
+          <div className="w-full">
+            <h2 className="mb-4 text-lg font-medium">选择模型</h2>
+            {!selectedTarget || selectedTarget.models.length === 0 ? (
+              <div className="text-sm text-muted-foreground">该端点未上报模型清单</div>
+            ) : (
+              <div className="space-y-1">
+                {selectedTarget.models.map((m) => {
+                  const selected = model === m.id;
+                  return (
+                    <button
+                      key={m.id}
+                      onClick={() => setModel(m.id)}
+                      className={cn(
+                        'flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left ring-2 ring-transparent transition-colors',
+                        selected ? 'bg-accent ring-primary' : 'hover:bg-muted/50',
+                      )}
+                    >
+                      <span className="font-medium">{m.label || m.id}</span>
+                      <div className="flex items-center gap-2">
+                        {m.isDefault && <Badge variant="secondary">默认</Badge>}
+                        {selected && <Check className="size-4 text-primary" />}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            <div className="mt-4 flex justify-between">
+              <Button variant="ghost" size="sm" onClick={handleBack}>
+                <ArrowLeft />
+                返回
+              </Button>
+              <Button onClick={handleCreate} disabled={!model || submitting}>
+                {submitting && <Spinner className="size-4" />}
+                {submitting ? '创建中...' : '创建会话'}
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

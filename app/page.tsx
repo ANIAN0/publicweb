@@ -39,8 +39,8 @@ interface SessionItem {
   model: string;
   title: string | null;
   userTitle: string | null;
-  deviceId: string | null;
-  deviceName: string | null;
+  targetId: string | null;
+  targetName: string | null;
   messageCount: number;
   lastActiveAt: string | number; // Date 经 JSON 序列化后变成 string
 }
@@ -327,7 +327,7 @@ function SessionRow({
               </div>
               {/* 元信息:设备 · 消息数 · 相对时间 */}
               <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                {item.deviceName && <span>{item.deviceName} · </span>}
+                {item.targetName && <span>{item.targetName} · </span>}
                 <span>
                   {item.messageCount} 条 · {formatRelative(new Date(item.lastActiveAt))}
                 </span>

@@ -1,11 +1,10 @@
 import { Client, MessageResponse } from 'eve/client';
-import { BackendAdapter, ModelInfo, ChatMessage } from './types';
+import { BackendAdapter, ChatMessage, ExecutionTarget } from './types';
 import { WebtoolEvent } from '../protocol/events';
 import { EventBus } from './event-bus';
 import { getDb } from '../db/client';
-import { sessions, messages } from '../db/schema';
+import { sessions, messages, eveServices } from '../db/schema';
 import { eq, and, asc, desc } from 'drizzle-orm';
-import { ulid } from 'ulid';
 import { persistSessionEvent } from './persist';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -25,42 +24,67 @@ function eveLog(msg: string): void {
 const eventBus = new EventBus();
 
 /**
- * EveagentBackend — bridges webtool sessions with an eve HTTP server.
+ * EveagentBackend — bridges webtool sessions with eve HTTP servers.
  *
- * Deployed eve servers (e.g. https://hunian003-evework.hf.space) end a turn with
- * `session.completed`, which makes the eve client reset its local state. The next
- * user message therefore starts a fresh durable session on the server, so we pass
- * the webtool-side history as `clientContext` on every turn to keep the model
- * aware of the conversation. See docs/guides/client/continuations and
- * docs/concepts/sessions-runs-and-streaming in the eve repo.
+ * 一个 eve 部署 = 一个 root agent = 一个 model(部署时 agent.ts 写死),
+ * 所以每个 eve 服务(target)绑死一个模型,客户端不能选模型——选模型 = 选 eve 服务。
+ * 多个 eve 服务(不同部署/不同模型)通过 eve_services 表管理,listTargets 从表读。
  */
 export class EveagentBackend implements BackendAdapter {
   readonly id = 'eveagent' as const;
-  private clients = new Map<string, Client>();
+  readonly label = 'Eveagent';
+  readonly description = '远程云端 agent';
+
+  private clients = new Map<string, Client>();           // host → Client(已按 host 缓存,支持多服务)
+  private sessionToHost = new Map<string, string>();     // sessionId → host(startSession 记,send 取)
   // Per-webtool-session serialization: queue sends so each turn's response is
   // fully consumed before the next send() goes out. The eve docs require this:
   // "send one follow-up at a time and wait for the next session.waiting event".
   private turnChain = new Map<string, Promise<void>>();
+  // Per-session AbortController：send 时建一个，stop 时 abort()，runTurn 结束后清理
+  private abortControllers = new Map<string, AbortController>();
 
-  async listModels(): Promise<ModelInfo[]> {
-    // info() requires auth on the deployed eve server; fall back to a hard-coded
-    // label so the chat UI can still render. Frontend hardcodes its own model
-    // for now, so this path is rarely hit.
-    return [{ id: 'eveagent-default', label: 'eve agent (remote)', isDefault: true }];
+  async listTargets(): Promise<ExecutionTarget[]> {
+    const db = await getDb();
+    const rows = await db.select().from(eveServices);
+    // 并发探活每个服务:任何 HTTP 响应都算在线(服务在响应,即使需 auth),
+    // 只有网络错误/超时才算离线
+    const targets = await Promise.all(rows.map(async (svc) => {
+      const online = await this.probe(svc.host);
+      return {
+        id: svc.id,
+        name: svc.name,
+        online,
+        // 一个 eve 服务绑死一个模型(部署时写死),models 单元素
+        models: [{ id: svc.model, label: svc.model, isDefault: true }],
+        meta: { host: svc.host },
+      } as ExecutionTarget;
+    }));
+    return targets;
   }
 
-  async startSession(opts: { sessionId: string; model: string; history: ChatMessage[]; deviceId?: string }): Promise<void> {
-    // No eve-side setup needed: the per-turn send() creates a fresh eve session
-    // and ships history via clientContext. We only verify the row exists.
-    const { sessionId } = opts;
+  // 探活:fetch /info,任何 HTTP 响应 = 在线,网络错误/超时 = 离线
+  private async probe(host: string): Promise<boolean> {
+    try {
+      await fetch(`${host}/info`, { signal: AbortSignal.timeout(2000) });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async startSession(opts: { sessionId: string; model: string; targetId: string; history: ChatMessage[] }): Promise<void> {
+    // targetId = eve_service.id,查 host 记映射。
+    // model 由服务端绑定(eve 不接受 client 传 model),这里仅由调用方记录到 sessions.model(展示用)。
+    const { sessionId, targetId } = opts;
     const db = await getDb();
+    const [svc] = await db.select().from(eveServices).where(eq(eveServices.id, targetId)).limit(1);
+    if (!svc) throw new Error(`eve service not found: ${targetId}`);
+    this.sessionToHost.set(sessionId, svc.host);
+    // 校验 session 行存在(原逻辑)
     const [session] = await db.select().from(sessions).where(eq(sessions.id, sessionId)).limit(1);
     if (!session) throw new Error(`Session ${sessionId} not found`);
   }
-
-  // Per-session AbortController：send 时建一个，stop 时 abort()，runTurn 结束后清理
-  // 这是 F-009 主动停止的载体：abort 会让 eve client 的 send POST 与后续 stream 都被取消
-  private abortControllers = new Map<string, AbortController>();
 
   async send(sessionId: string, content: string): Promise<void> {
     // 取消上一次未结束的 controller（防御性，正常 UI 不会在跑时再点发送）
@@ -68,7 +92,15 @@ export class EveagentBackend implements BackendAdapter {
     const controller = new AbortController();
     this.abortControllers.set(sessionId, controller);
 
-    const next = prev.then(() => this.runTurn(sessionId, content, controller.signal)).catch((err) => {
+    // 拿 host:优先内存映射,缺失回退查 sessions.targetId → eve_services.host
+    let host = this.sessionToHost.get(sessionId);
+    if (!host) {
+      host = await this.lookupHost(sessionId);
+      if (host) this.sessionToHost.set(sessionId, host);
+    }
+    if (!host) throw new Error(`session ${sessionId} not bound to an eve service`);
+
+    const next = prev.then(() => this.runTurn(sessionId, content, controller.signal, host!)).catch((err) => {
       // abort 抛 AbortError 是预期路径，不打 ERROR 噪音
       if (err?.name !== 'AbortError') {
         console.error(`[eveagent] turn error sid=${sessionId}:`, err);
@@ -83,11 +115,22 @@ export class EveagentBackend implements BackendAdapter {
     return next;
   }
 
-  private async runTurn(sessionId: string, content: string, signal: AbortSignal): Promise<void> {
+  // 回退查 host:session.targetId → eve_services.host
+  private async lookupHost(sessionId: string): Promise<string | undefined> {
+    const db = await getDb();
+    const [sess] = await db.select({ targetId: sessions.targetId })
+      .from(sessions).where(eq(sessions.id, sessionId)).limit(1);
+    if (!sess?.targetId) return undefined;
+    const [svc] = await db.select({ host: eveServices.host })
+      .from(eveServices).where(eq(eveServices.id, sess.targetId)).limit(1);
+    return svc?.host ?? undefined;
+  }
+
+  private async runTurn(sessionId: string, content: string, signal: AbortSignal, host: string): Promise<void> {
     const db = await getDb();
     const history = await this.loadHistoryForContext(sessionId);
 
-    const client = this.getClient();
+    const client = this.getClient(host);
     const clientSession = client.session();
 
     const clientContext = history.length > 0
@@ -95,7 +138,7 @@ export class EveagentBackend implements BackendAdapter {
       : undefined;
 
     // [eve] 记录请求：host + content 预览 + history 条数 + clientContext 长度
-    eveLog(`runTurn sid=${sessionId} host=${process.env.EVE_HOST} content=${JSON.stringify(content.slice(0, 50))} historyLen=${history.length} clientContextLen=${clientContext?.length ?? 0}`);
+    eveLog(`runTurn sid=${sessionId} host=${host} content=${JSON.stringify(content.slice(0, 50))} historyLen=${history.length} clientContextLen=${clientContext?.length ?? 0}`);
 
     const response: MessageResponse = await clientSession.send({
       message: content,
@@ -118,8 +161,7 @@ export class EveagentBackend implements BackendAdapter {
 
     // Single-use MessageResponse: iterate to consume the NDJSON stream and
     // advance the client cursor. The loop exits when the turn boundary event
-    // (`session.waiting` / `session.completed` / `session.failed`) closes the
-    // stream, OR when the signal aborts (eve client throws / breaks iteration).
+    // closes the stream, OR when the signal aborts.
     try {
       for await (const event of response) {
         if (signal.aborted) break;
@@ -180,8 +222,7 @@ export class EveagentBackend implements BackendAdapter {
     return eventBus.subscribe(sessionId, cb);
   }
 
-  private getClient(): Client {
-    const host = process.env.EVE_HOST || 'http://127.0.0.1:3000';
+  private getClient(host: string): Client {
     let client = this.clients.get(host);
     if (!client) {
       client = new Client({ host });
@@ -234,8 +275,4 @@ export class EveagentBackend implements BackendAdapter {
     }
     return null;
   }
-
-  // 消息持久化已迁移到 ./persist 模块（persistSessionEvent），与 LocalBackend 共享。
-  // 这样既修了 REV-005-1（本地后端不落库的 BLOCKER）也修了 REV-005-15
-  // （eveagent 丢弃 tool.call/tool.result/reasoning）。
 }

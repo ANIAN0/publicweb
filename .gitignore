@@ -47,9 +47,7 @@ next-env.d.ts
 .dns-override.cjs
 
 # SQLite 数据库文件（Drizzle ORM 数据存储）
-data/*.db
-data/*.sqlite
-data/*.sqlite3
+data/
 
 # Drizzle 迁移元数据（自动生成的快照，不应手动提交）
 /drizzle/meta/

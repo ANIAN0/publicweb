@@ -5,6 +5,7 @@ import { getDb } from '@/lib/db/client';
 import { devices, deviceSupportedBackends, deviceModels, sessions, messages } from '@/lib/db/schema';
 import { eq, and, isNull, gt } from 'drizzle-orm';
 import { hashToken } from '@/lib/auth/token';
+import { extractTextFromParts } from '@/lib/backends/persist';
 import { sessionEventBus } from '@/lib/events/session-bus';
 
 interface DeviceConnection {
@@ -108,7 +109,8 @@ export function attachDeviceGateway(
           gt(sessions.lastActiveAt, threshold),
         ));
       for (const sess of resumable) {
-        const history = await db.select({ role: messages.role, content: messages.content })
+        // 新 schema 无 content 列,从 parts 提取 text(降级点 #2,完整 parts 见 05 后续 adapter 改造)
+        const historyRows = await db.select({ role: messages.role, parts: messages.parts })
           .from(messages)
           .where(eq(messages.sessionId, sess.id))
           .orderBy(messages.seq);
@@ -117,7 +119,10 @@ export function attachDeviceGateway(
           sessionId: sess.id,
           backend: sess.backend as 'claudecode' | 'pi',
           model: sess.model,
-          history: history.map((m) => ({ role: m.role, content: m.content })),
+          history: historyRows
+            .filter((m) => m.role === 'user' || m.role === 'assistant')
+            .map((m) => ({ role: m.role, content: extractTextFromParts(m.parts) }))
+            .filter((m) => m.content),
         };
         // 1) UI 横幅复位（SSE 通道）
         sessionEventBus.emit(sess.id, startEvent);

@@ -7,7 +7,7 @@
 // 设计:startSession 记录 sessionId → targetId(deviceId) 内存映射,send/stop 走映射
 // 而不查 DB(避免每个 turn 多一次 IO)。
 import { BackendAdapter, ModelInfo, ChatMessage, ExecutionTarget } from './types';
-import { WebtoolEvent } from '@/lib/protocol/events';
+import { WebtoolEvent, InputResponse } from '@/lib/protocol/events';
 import { sessionEventBus } from '@/lib/events/session-bus';
 import { sendToDevice } from '@/server/ws/device-gateway';
 import { getDb } from '@/lib/db/client';
@@ -83,7 +83,9 @@ export class LocalBackend implements BackendAdapter {
     this.sessionUnsubscribers.set(opts.sessionId, unsub);
   }
 
-  async send(sessionId: string, content: string): Promise<void> {
+  // local(claudecode/pi)的 HITL 走 Claude Code 自有 AskUserQuestion 格式(questions 数组),
+  // 与 eve 的 inputResponses 不同路线;本次不实现,opts 忽略,签名对齐 BackendAdapter
+  async send(sessionId: string, content: string, _opts?: { inputResponses?: InputResponse[] }): Promise<void> {
     // 优先用内存映射;缺失时回退查 sessions.targetId(webtool 重启/设备重连后内存映射空)
     let targetId = this.sessionToTarget.get(sessionId);
     if (!targetId) {

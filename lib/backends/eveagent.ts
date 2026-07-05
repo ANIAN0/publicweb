@@ -1,11 +1,11 @@
 import { Client, MessageResponse } from 'eve/client';
 import { BackendAdapter, ChatMessage, ExecutionTarget } from './types';
-import { WebtoolEvent } from '../protocol/events';
+import { WebtoolEvent, type WebtoolMessageMetadata, type InputResponse } from '../protocol/events';
 import { EventBus } from './event-bus';
 import { getDb } from '../db/client';
 import { sessions, messages, eveServices } from '../db/schema';
 import { eq, and, asc, desc } from 'drizzle-orm';
-import { persistSessionEvent } from './persist';
+import { persistSessionEvent, extractTextFromParts } from './persist';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
@@ -22,6 +22,25 @@ function eveLog(msg: string): void {
 }
 
 const eventBus = new EventBus();
+
+// 剥离 action,只保留前端 UI 可见的 inputRequest 字段(对齐 eve client toMessageInputRequest)
+// 前端 InputRequestCard 据此渲染:prompt 问题文案 + display 三态 + options 选项 + allowFreeform 自定义文本
+// 注意:options 用 mutable 数组(AI SDK toolMetadata 是 JSONValue,不接受 readonly JSONArray)
+function toMessageInputRequest(request: any): {
+  requestId: string;
+  prompt: string;
+  display?: 'confirmation' | 'select' | 'text';
+  options?: { id: string; label: string; description?: string; style?: 'danger' | 'default' | 'primary' }[];
+  allowFreeform?: boolean;
+} {
+  return {
+    requestId: request.requestId,
+    prompt: request.prompt,
+    ...(request.display !== undefined ? { display: request.display } : {}),
+    ...(request.options !== undefined ? { options: request.options } : {}),
+    ...(request.allowFreeform !== undefined ? { allowFreeform: request.allowFreeform } : {}),
+  };
+}
 
 /**
  * EveagentBackend — bridges webtool sessions with eve HTTP servers.
@@ -43,6 +62,8 @@ export class EveagentBackend implements BackendAdapter {
   private turnChain = new Map<string, Promise<void>>();
   // Per-session AbortController：send 时建一个，stop 时 abort()，runTurn 结束后清理
   private abortControllers = new Map<string, AbortController>();
+  // 当前 turn 状态:turnId 用于 partId 合成(${turnId}:${stepIndex}:type),startedParts 记录已 part.start 的 partId(避免重复 start),turnEnded 去重边界事件
+  private turnState = new Map<string, { turnId: string | null; startedParts: Set<string>; turnEnded: boolean }>();
 
   async listTargets(): Promise<ExecutionTarget[]> {
     const db = await getDb();
@@ -63,10 +84,12 @@ export class EveagentBackend implements BackendAdapter {
     return targets;
   }
 
-  // 探活:fetch /info,任何 HTTP 响应 = 在线,网络错误/超时 = 离线
+  // 探活:fetch /info,任何 HTTP 响应 = 在线,网络错误/超时 = 离线。
+  // 超时 10s:云端 eve(hf.space)首次请求含 DNS+TLS 握手+冷启动,2s 易误判离线
+  // (实测首次 ~2s+ 超时,热连接 ~1.8s)。probe 并发(Promise.all),10s 是总上限非 N×10s。
   private async probe(host: string): Promise<boolean> {
     try {
-      await fetch(`${host}/info`, { signal: AbortSignal.timeout(2000) });
+      await fetch(`${host}/info`, { signal: AbortSignal.timeout(10000) });
       return true;
     } catch {
       return false;
@@ -86,11 +109,13 @@ export class EveagentBackend implements BackendAdapter {
     if (!session) throw new Error(`Session ${sessionId} not found`);
   }
 
-  async send(sessionId: string, content: string): Promise<void> {
+  async send(sessionId: string, content: string, opts?: { inputResponses?: InputResponse[] }): Promise<void> {
     // 取消上一次未结束的 controller（防御性，正常 UI 不会在跑时再点发送）
     const prev = this.turnChain.get(sessionId) ?? Promise.resolve();
     const controller = new AbortController();
     this.abortControllers.set(sessionId, controller);
+    // HITL 回答(inputResponses)透传到 runTurn → clientSession.send;eve 同 session 续接(durable)
+    const inputResponses = opts?.inputResponses;
 
     // 拿 host:优先内存映射,缺失回退查 sessions.targetId → eve_services.host
     let host = this.sessionToHost.get(sessionId);
@@ -100,7 +125,7 @@ export class EveagentBackend implements BackendAdapter {
     }
     if (!host) throw new Error(`session ${sessionId} not bound to an eve service`);
 
-    const next = prev.then(() => this.runTurn(sessionId, content, controller.signal, host!)).catch((err) => {
+    const next = prev.then(() => this.runTurn(sessionId, content, controller.signal, host!, inputResponses)).catch((err) => {
       // abort 抛 AbortError 是预期路径，不打 ERROR 噪音
       if (err?.name !== 'AbortError') {
         console.error(`[eveagent] turn error sid=${sessionId}:`, err);
@@ -126,23 +151,42 @@ export class EveagentBackend implements BackendAdapter {
     return svc?.host ?? undefined;
   }
 
-  private async runTurn(sessionId: string, content: string, signal: AbortSignal, host: string): Promise<void> {
+  private async runTurn(sessionId: string, content: string, signal: AbortSignal, host: string, inputResponses?: InputResponse[]): Promise<void> {
     const db = await getDb();
     const history = await this.loadHistoryForContext(sessionId);
 
     const client = this.getClient(host);
-    const clientSession = client.session();
+
+    // resume eve durable session:从 db 取上次 turn 持久化的 sessionId + continuationToken,
+    // 喂给 client.session(state)。否则每次 client.session() 都新建会话,HITL 回答(inputResponses-only)
+    // 无 continuationToken,createHandleMessageBody 命中 "continuationToken===undefined && message===undefined"
+    // 返回 null,抛 "Session.send requires a non-empty message, inputResponses, or both"
+    // (eve client/session.ts:345-355:inputResponses 必须配 continuationToken 才能构造 body)
+    const [sessRow] = await db.select({
+      eveSessionId: sessions.eveSessionId,
+      eveContinuationToken: sessions.eveContinuationToken,
+    }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
+    const sessionState = sessRow?.eveSessionId
+      ? { sessionId: sessRow.eveSessionId, continuationToken: sessRow.eveContinuationToken ?? undefined, streamIndex: 0 }
+      : undefined;
+    if (sessionState) {
+      eveLog(`resume sid=${sessionId} eveSessionId=${sessionState.sessionId} hasToken=${sessionState.continuationToken !== undefined} inputResponsesLen=${inputResponses?.length ?? 0}`);
+    }
+    const clientSession = client.session(sessionState);
 
     const clientContext = history.length > 0
       ? JSON.stringify(history.map((m) => ({ role: m.role, content: m.content })))
       : undefined;
 
-    // [eve] 记录请求：host + content 预览 + history 条数 + clientContext 长度
-    eveLog(`runTurn sid=${sessionId} host=${host} content=${JSON.stringify(content.slice(0, 50))} historyLen=${history.length} clientContextLen=${clientContext?.length ?? 0}`);
+    // [eve] 记录请求：host + content 预览 + history 条数 + clientContext 长度 + inputResponses 条数
+    eveLog(`runTurn sid=${sessionId} host=${host} content=${JSON.stringify(content.slice(0, 50))} historyLen=${history.length} clientContextLen=${clientContext?.length ?? 0} inputResponsesLen=${inputResponses?.length ?? 0}`);
 
+    // eve client send 允许只有 inputResponses 无 message(HITL 回答);content 为空时传 undefined
+    // (session.ts 校验:message 或 inputResponses 至少一个非空)
     const response: MessageResponse = await clientSession.send({
-      message: content,
+      message: content || undefined,
       signal,
+      ...(inputResponses?.length ? { inputResponses } : {}),
       ...(clientContext ? { clientContext } : {}),
     });
 
@@ -166,18 +210,22 @@ export class EveagentBackend implements BackendAdapter {
       for await (const event of response) {
         if (signal.aborted) break;
         // [eve] 记录每个流式事件的 type + data 顶层字段名（截断防刷屏）
-        const dataKeys = event?.data ? Object.keys(event.data).join(',') : '-';
+        // event 是 HandleMessageStreamEvent 联合,部分成员(如 SessionCompletedStreamEvent)无 data,用 narrowing
+        const eventData = 'data' in event ? (event as { data?: Record<string, unknown> }).data : undefined;
+        const dataKeys = eventData ? Object.keys(eventData).join(',') : '-';
         eveLog(`event sid=${sessionId} type=${event?.type} dataKeys=${dataKeys}`);
-        const webtoolEvent = this.mapEveEventToWebtoolEvent(event);
-        if (!webtoolEvent) {
+        // 一个 eve 事件可能映射出多个 WebtoolEvent(actions.requested 遍历、message.appended 先 start 再 delta)
+        const webtoolEvents = this.mapEveEventToWebtoolEvent(event, sessionId);
+        if (webtoolEvents.length === 0) {
           // [eve] 未映射的事件（system/status 等），记录后跳过
           eveLog(`event unmapped sid=${sessionId} type=${event?.type} -> skip`);
           continue;
         }
-        eveLog(`event mapped sid=${sessionId} eveType=${event?.type} -> webtoolType=${webtoolEvent.type}`);
-        eventBus.emit(sessionId, webtoolEvent);
-        // 修复 REV-005-15：走共享 persist 模块，确保 reasoning/tool.call/tool.result 都落库
-        await persistSessionEvent(sessionId, webtoolEvent);
+        for (const we of webtoolEvents) {
+          eveLog(`event mapped sid=${sessionId} eveType=${event?.type} -> webtoolType=${we.type}`);
+          eventBus.emit(sessionId, we);
+          await persistSessionEvent(sessionId, we);
+        }
       }
       // [eve] 流正常结束
       eveLog(`stream end sid=${sessionId} aborted=${signal.aborted}`);
@@ -204,9 +252,14 @@ export class EveagentBackend implements BackendAdapter {
       .where(and(eq(messages.sessionId, sessionId), eq(messages.role, 'assistant')))
       .orderBy(desc(messages.seq))
       .limit(1);
-    if (lastAssistant && lastAssistant.finishReason === null) {
+    if (!lastAssistant) return;
+    // finishReason 现存于 metadata JSON 列(非旧 finishReason 列)
+    let meta: Record<string, unknown> = {};
+    try { meta = lastAssistant.metadata ? JSON.parse(lastAssistant.metadata) : {}; } catch { /* 损坏元数据当空 */ }
+    if (meta.finishReason === undefined) {
+      meta.finishReason = 'interrupted';
       await db.update(messages)
-        .set({ finishReason: 'interrupted' })
+        .set({ metadata: JSON.stringify(meta) })
         .where(eq(messages.id, lastAssistant.id));
     }
   }
@@ -233,46 +286,186 @@ export class EveagentBackend implements BackendAdapter {
 
   private async loadHistoryForContext(sessionId: string): Promise<ChatMessage[]> {
     const db = await getDb();
-    const rows = await db.select({ role: messages.role, content: messages.content })
+    // 新 schema 无 content 列,从 parts 提取 text(降级点 #2:eve clientContext 仅需文本;完整 parts 传递见 05 后续 adapter 改造)
+    const rows = await db.select({ role: messages.role, parts: messages.parts })
       .from(messages)
       .where(eq(messages.sessionId, sessionId))
       .orderBy(asc(messages.seq));
     return rows
-      .filter((r) => r.content && (r.role === 'user' || r.role === 'assistant'))
-      .map((r) => ({ role: r.role as 'user' | 'assistant', content: r.content }));
+      .filter((r) => r.role === 'user' || r.role === 'assistant')
+      .map((r) => ({ role: r.role as 'user' | 'assistant', content: extractTextFromParts(r.parts) }))
+      .filter((r) => r.content);
   }
 
-  private mapEveEventToWebtoolEvent(eveEvent: any): WebtoolEvent | null {
-    // Per docs/concepts/sessions-runs-and-streaming: streaming deltas carry
-    // both `*Delta` and `*SoFar` cumulative fields. We only need the delta.
-    if (eveEvent.type === 'message.appended') {
-      const delta = eveEvent.data?.messageDelta ?? eveEvent.data?.delta;
-      if (delta) return { type: 'text.delta', delta };
+  // eve 事件 → WebtoolEvent[](按 04-adapter-mapping.md eve 表 + 06 partId 规则)
+  // 一个 eve 事件可能产多个 WebtoolEvent(actions.requested 遍历、message.appended 先 start 再 delta)
+  private mapEveEventToWebtoolEvent(eveEvent: any, sessionId: string): WebtoolEvent[] {
+    const st = this.turnState.get(sessionId) ?? { turnId: null as string | null, startedParts: new Set<string>(), turnEnded: false };
+    this.turnState.set(sessionId, st);
+    const out: WebtoolEvent[] = [];
+    const t = eveEvent?.type;
+    const d = eveEvent?.data ?? {};
+
+    // turn.started:记录 turnId,重置 turnEnded + startedParts(新 turn 重新分配 partId)
+    if (t === 'turn.started') {
+      st.turnId = d.turnId ?? null;
+      st.turnEnded = false;
+      st.startedParts.clear();
+      return out;
     }
-    if (eveEvent.type === 'actions.requested' && Array.isArray(eveEvent.data?.actions)) {
-      const call = eveEvent.data.actions[0];
-      if (call) return { type: 'tool.call', id: call.callId, name: call.toolName, input: call.input };
+
+    // message.appended:text 增量;首次先 part.start(streaming),后续 part.delta
+    if (t === 'message.appended') {
+      const delta = d.messageDelta ?? d.delta;
+      if (!delta) return out;
+      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:text`;
+      if (!st.startedParts.has(partId)) {
+        out.push({ type: 'part.start', partId, part: { type: 'text', text: '', state: 'streaming' } });
+        st.startedParts.add(partId);
+      }
+      out.push({ type: 'part.delta', partId, field: 'text', delta });
+      return out;
     }
-    if (eveEvent.type === 'action.result') {
-      const r = eveEvent.data?.result ?? {};
-      const output = typeof r.output === 'string' ? r.output : JSON.stringify(r.output ?? '');
-      return {
-        type: 'tool.result',
-        id: r.callId,
-        output,
-        isError: eveEvent.data?.status === 'failed' || r.isError === true,
+
+    // message.completed:text part 结束(带最终 message 校正)
+    if (t === 'message.completed') {
+      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:text`;
+      out.push({ type: 'part.end', partId, part: { type: 'text', text: d.message ?? '', state: 'done' } });
+      return out;
+    }
+
+    // reasoning.appended:reasoning 增量
+    if (t === 'reasoning.appended') {
+      const delta = d.reasoningDelta ?? d.delta;
+      if (!delta) return out;
+      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:reasoning`;
+      if (!st.startedParts.has(partId)) {
+        out.push({ type: 'part.start', partId, part: { type: 'reasoning', text: '', state: 'streaming' } });
+        st.startedParts.add(partId);
+      }
+      out.push({ type: 'part.delta', partId, field: 'reasoning', delta });
+      return out;
+    }
+
+    // reasoning.completed:reasoning part 结束
+    if (t === 'reasoning.completed') {
+      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:reasoning`;
+      out.push({ type: 'part.end', partId, part: { type: 'reasoning', text: d.reasoning ?? '', state: 'done' } });
+      return out;
+    }
+
+    // actions.requested:遍历整个 actions[](修原只取 [0] 的 bug);eve input 一次性给全 → state=input-available
+    if (t === 'actions.requested' && Array.isArray(d.actions)) {
+      for (const call of d.actions) {
+        if (!call?.callId) continue;
+        const partId = call.callId;
+        out.push({
+          type: 'part.start', partId,
+          part: {
+            type: 'dynamic-tool',
+            toolName: call.toolName ?? call.name ?? 'unknown',
+            toolCallId: call.callId,
+            state: 'input-available',
+            input: call.input ?? {},
+          },
+        });
+        st.startedParts.add(partId);
+      }
+      return out;
+    }
+
+    // input.requested:HITL 问题(eve ask_question 或带 approval 的工具)。每个 request → dynamic-tool part
+    // state=approval-requested,inputRequest 挂 toolMetadata.eve.inputRequest(前端按 display 渲染卡片)
+    // requestId(=action.callId)作 partId,与后续 action.result 的 callId 一致,part.update 能定位
+    // 对齐 eve client message-reducer.ts:147-169 的投影
+    if (t === 'input.requested' && Array.isArray(d.requests)) {
+      for (const request of d.requests) {
+        if (!request?.requestId) continue;
+        const partId = request.requestId;
+        const action = request.action ?? {};
+        out.push({
+          type: 'part.start', partId,
+          part: {
+            type: 'dynamic-tool',
+            toolName: action.toolName ?? 'ask_question',
+            toolCallId: action.callId ?? request.requestId,
+            state: 'approval-requested',
+            input: action.input ?? {},
+            // approval.id=requestId:对齐 eve client,使 ai-elements Confirmation 也可关联
+            approval: { id: request.requestId },
+            toolMetadata: {
+              eve: {
+                inputRequest: toMessageInputRequest(request),
+                kind: action.kind ?? 'tool-call',
+                name: action.toolName ?? 'ask_question',
+              },
+            },
+          },
+        });
+        st.startedParts.add(partId);
+      }
+      return out;
+    }
+
+    // action.result:更新 tool part state + output(completed→output-available / failed→output-error / rejected→output-denied)
+    if (t === 'action.result') {
+      const r = d.result ?? {};
+      const partId = r.callId;
+      if (!partId) return out;
+      const status = d.status;
+      const patch: Record<string, unknown> = {
+        state: status === 'failed' ? 'output-error' : status === 'rejected' ? 'output-denied' : 'output-available',
+        output: typeof r.output === 'string' ? r.output : JSON.stringify(r.output ?? ''),
       };
+      if (status === 'failed') patch.errorText = r.output ?? '';
+      out.push({ type: 'part.update', partId, patch });
+      return out;
     }
-    if (eveEvent.type === 'reasoning.appended') {
-      const delta = eveEvent.data?.reasoningDelta ?? eveEvent.data?.delta;
-      if (delta) return { type: 'reasoning.delta', delta };
+
+    // step.completed:token/成本(usage 嵌套在 d.usage:costUsd/inputTokens/outputTokens/cacheReadTokens)。
+    // 不写 finishReason 到 metadata——那是 turn 级边界标志(只由 turn.completed 写),
+    // 否则 tool-loop 中间 step 的 finishReason='tool-calls' 会让 persist.getOrCreateCurrentAssistant
+    // 误判 turn 已结束,把同一 turn 的后续 step 拆到新 assistant 消息(破坏一 turn 一 assistant 语义)。
+    if (t === 'step.completed') {
+      const meta: Partial<WebtoolMessageMetadata> = {};
+      if (d.usage) {
+        meta.usage = {
+          inputTokens: d.usage.inputTokens,
+          outputTokens: d.usage.outputTokens,
+          // eve 字段名是 cacheReadTokens,映射到 WebtoolMessageMetadata.usage.cachedInputTokens
+          cachedInputTokens: d.usage.cacheReadTokens,
+        };
+        // cost 也在 d.usage 里(非顶层 d.costUsd)
+        if (d.usage.costUsd != null) meta.cost = d.usage.costUsd;
+      }
+      if (Object.keys(meta).length > 0) out.push({ type: 'message.metadata', metadata: meta });
+      return out;
     }
-    if (eveEvent.type === 'turn.completed') {
-      return { type: 'turn.completed', finishReason: eveEvent.data?.finishReason || 'stop' };
+
+    // session.started:提取 modelId(runtime identity)
+    if (t === 'session.started') {
+      if (d.runtime?.modelId) out.push({ type: 'message.metadata', metadata: { modelId: d.runtime.modelId } });
+      return out;
     }
-    if (eveEvent.type === 'turn.failed' || eveEvent.type === 'step.failed') {
-      return { type: 'turn.completed', finishReason: 'error' };
+
+    // 边界事件:turn.completed/failed/session.waiting/completed/failed(去重,首个边界发 turn.completed)
+    const isBoundary = t === 'turn.completed' || t === 'turn.failed' || t === 'session.waiting' || t === 'session.completed' || t === 'session.failed';
+    if (isBoundary) {
+      if (!st.turnEnded) {
+        if (t === 'turn.failed' || t === 'session.failed') {
+          out.push({ type: 'turn.completed', finishReason: 'error', error: { code: t, message: d.message ?? t } });
+        } else {
+          out.push({ type: 'turn.completed', finishReason: 'stop' });
+        }
+        st.turnEnded = true;
+      }
+      // session.failed 表示会话死亡,追加 disconnected
+      if (t === 'session.failed') {
+        out.push({ type: 'session.disconnected', reason: 'restart' });
+      }
+      return out;
     }
-    return null;
+
+    return out; // 其他事件(step.started/message.received/compaction.*/subagent.*/authorization.*/result.completed)暂未映射
   }
 }

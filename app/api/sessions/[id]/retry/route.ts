@@ -8,6 +8,7 @@ import { getDb } from '@/lib/db/client';
 import { sessions, messages } from '@/lib/db/schema';
 import { eq, and, isNull, asc } from 'drizzle-orm';
 import { getBackendAdapter } from '@/lib/backends/router';
+import { extractTextFromParts } from '@/lib/backends/persist';
 
 export async function POST(
   request: NextRequest,
@@ -23,14 +24,16 @@ export async function POST(
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
 
-  // 从 DB 读 history（含 user + assistant）作为 client context
-  const historyRows = await db.select({ role: messages.role, content: messages.content })
+  // 从 DB 读 history(含 user + assistant)作为 client context
+  // 新 schema 无 content 列,从 parts 提取 text(降级点 #2,完整 parts 传递见 05 后续 adapter 改造)
+  const historyRows = await db.select({ role: messages.role, parts: messages.parts })
     .from(messages)
     .where(eq(messages.sessionId, id))
     .orderBy(asc(messages.seq));
   const history = historyRows
     .filter((r) => r.role === 'user' || r.role === 'assistant')
-    .map((r) => ({ role: r.role as 'user' | 'assistant', content: r.content }));
+    .map((r) => ({ role: r.role as 'user' | 'assistant', content: extractTextFromParts(r.parts) }))
+    .filter((r) => r.content);
 
   // 调对应 adapter.startSession:targetId 多态(local=device.id 派发 WS,eveagent=eve_service.id 选 host)
   const adapter = getBackendAdapter(session.backend);

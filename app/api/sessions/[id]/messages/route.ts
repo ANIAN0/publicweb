@@ -60,7 +60,8 @@ export async function POST(
     sessionId: id,
     seq: nextSeq,
     role: 'user',
-    content,
+    // user 消息存 parts 单元素(与 assistant 形态统一,见 05-schema-design.md 约束#3)
+    parts: JSON.stringify([{ type: 'text', text: content }]),
     createdAt: now,
   });
 

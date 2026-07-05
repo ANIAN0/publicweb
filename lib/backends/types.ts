@@ -1,4 +1,4 @@
-import { WebtoolEvent } from '../protocol/events';
+import { WebtoolEvent, InputResponse } from '../protocol/events';
 
 export interface ModelInfo { id: string; label: string; isDefault?: boolean }
 export interface ChatMessage { role: 'user' | 'assistant' | 'tool'; content: string; toolCalls?: ToolCall[]; toolResults?: ToolResult[] }
@@ -27,8 +27,8 @@ export interface BackendAdapter extends BackendDescriptor {
   listTargets(): Promise<ExecutionTarget[]>;
   /** 创建或续接一个 session;targetId 对 local 是 device.id,对 eveagent 是 eve_service.id */
   startSession(opts: { sessionId: string; model: string; targetId: string; history: ChatMessage[] }): Promise<void>;
-  /** 发送一条用户消息（不等待响应） */
-  send(sessionId: string, content: string): Promise<void>;
+  /** 发送一条用户消息（不等待响应）；opts.inputResponses 用于回答 HITL ask_question（eve 路线） */
+  send(sessionId: string, content: string, opts?: { inputResponses?: InputResponse[] }): Promise<void>;
   /** 主动停止当前 turn（不 kill agent 进程） */
   stop(sessionId: string): Promise<void>;
   /** 订阅一个 session 的事件 */

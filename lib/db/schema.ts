@@ -62,18 +62,15 @@ export const sessions = sqliteTable('sessions', {
 });
 
 export const messages = sqliteTable('messages', {
-  id: text('id').primaryKey(),                                 // ulid
+  id: text('id').primaryKey(),                                 // UIMessage.id(ulid)
   sessionId: text('session_id').notNull().references(() => sessions.id),
-  seq: integer('seq').notNull(),                               // 单 session 内顺序
-  role: text('role').notNull(),                                // 'user' | 'assistant' | 'tool' | 'system'
-  content: text('content').notNull().default(''),              // 文本片段 / 序列化 JSON
-  toolCalls: text('tool_calls'),                               // JSON: [{id, name, input}]
-  toolResults: text('tool_results'),                           // JSON: [{toolCallId, output, isError}]
-  reasoning: text('reasoning'),                                // 思考过程（REV-005-15：eveagent reasoning.delta 落库）
-  finishReason: text('finish_reason'),                         // 'stop' | 'interrupted' | 'error'
+  seq: integer('seq').notNull(),                               // 会话内顺序(拉取/重放/增量 since)
+  role: text('role').notNull(),                                // 'user' | 'assistant' | 'system'
+  parts: text('parts').notNull(),                              // JSON: Array<UIMessagePart> — 完整保序
+  metadata: text('metadata'),                                  // JSON: WebtoolMessageMetadata(可空)
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 }, t => ({
-  // REV-005-14：单 session 内 seq 必须唯一，防止 select max(seq)+1 竞态产生重复 seq，
+  // REV-005-14:单 session 内 seq 唯一,防 select max(seq)+1 竞态产生重复 seq,
   // 破坏 orderBy(seq) 与增量拉取语义。
   sessionSeqUnique: unique('messages_session_seq_unique').on(t.sessionId, t.seq),
 }));

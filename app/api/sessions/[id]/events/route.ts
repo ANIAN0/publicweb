@@ -9,7 +9,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const db = getDb();
+  const db = await getDb();
   const [session] = await db.select().from(sessions).where(eq(sessions.id, id)).limit(1);
   if (!session) {
     return new Response('Session not found', { status: 404 });

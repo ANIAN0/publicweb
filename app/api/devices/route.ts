@@ -4,7 +4,7 @@ import { devices, deviceSupportedBackends } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
 
 export async function GET() {
-  const db = getDb();
+  const db = await getDb();
   const allDevices = await db.select().from(devices);
   
   // 获取每个设备的 supported backends

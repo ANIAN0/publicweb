@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, primaryKey } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, primaryKey, unique } from 'drizzle-orm/sqlite-core';
 
 export const devices = sqliteTable('devices', {
   id: text('id').primaryKey(),                                  // ulid
@@ -54,6 +54,11 @@ export const messages = sqliteTable('messages', {
   content: text('content').notNull().default(''),              // 文本片段 / 序列化 JSON
   toolCalls: text('tool_calls'),                               // JSON: [{id, name, input}]
   toolResults: text('tool_results'),                           // JSON: [{toolCallId, output, isError}]
+  reasoning: text('reasoning'),                                // 思考过程（REV-005-15：eveagent reasoning.delta 落库）
   finishReason: text('finish_reason'),                         // 'stop' | 'interrupted' | 'error'
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
-});
+}, t => ({
+  // REV-005-14：单 session 内 seq 必须唯一，防止 select max(seq)+1 竞态产生重复 seq，
+  // 破坏 orderBy(seq) 与增量拉取语义。
+  sessionSeqUnique: unique('messages_session_seq_unique').on(t.sessionId, t.seq),
+}));

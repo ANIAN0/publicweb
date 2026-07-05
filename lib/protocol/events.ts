@@ -5,4 +5,5 @@ export type WebtoolEvent =
   | { type: 'reasoning.delta';   delta: string }
   | { type: 'turn.completed';    finishReason: 'stop' | 'interrupted' | 'error'; error?: { code: string; message: string } }
   | { type: 'session.connected' }
-  | { type: 'session.disconnected'; reason: 'client_offline' | 'network' | 'restart' };
+  | { type: 'session.disconnected'; reason: 'device_offline' | 'network' | 'restart' }
+  | { type: 'session.start';     sessionId: string; backend: string; model: string; history: Array<{ role: string; content: string }> };

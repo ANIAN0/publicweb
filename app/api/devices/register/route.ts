@@ -13,7 +13,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'setupToken is required' }, { status: 400 });
   }
 
-  const db = getDb();
+  const db = await getDb();
   const tokenHash = hashToken(setupToken);
 
   // 查找 setup token
@@ -52,7 +52,9 @@ export async function POST(request: NextRequest) {
     hostname: hostname || null,
     longLivedTokenHash,
     lastSeenAt: now,
-    online: true,
+    // register 仅是换取长期 token；真正的在线状态由 WS 网关在连接/断开时维护
+    // （修复 REV-005-7：避免 register 后未连 WS 就误显在线）
+    online: false,
     createdAt: now,
   });
 

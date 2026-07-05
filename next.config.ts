@@ -1,8 +1,8 @@
 import type { NextConfig } from "next";
-import { withEve } from 'eve/next';
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // turso 驱动是 CJS 包，Turbopack 无法 chunk，需声明 serverExternalPackages
+  serverExternalPackages: ['@tursodatabase/database'],
 };
 
-export default withEve(nextConfig, { eveRoot: '.' });
+export default nextConfig;

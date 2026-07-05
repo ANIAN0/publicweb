@@ -1,4 +1,4 @@
-import { migrate } from './lib/db/migrate';
+import { migrate } from './lib/db/client';
 
 export async function register() {
   // 确保在Next.js启动时运行迁移

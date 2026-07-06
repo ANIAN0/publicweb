@@ -39,8 +39,11 @@ CREATE TABLE `messages` (
 	`session_id` text NOT NULL,
 	`seq` integer NOT NULL,
 	`role` text NOT NULL,
-	`parts` text NOT NULL,
-	`metadata` text,
+	`content` text DEFAULT '' NOT NULL,
+	`tool_calls` text,
+	`tool_results` text,
+	`reasoning` text,
+	`finish_reason` text,
 	`created_at` integer NOT NULL,
 	FOREIGN KEY (`session_id`) REFERENCES `sessions`(`id`) ON UPDATE no action ON DELETE no action
 );
@@ -56,9 +59,6 @@ CREATE TABLE `sessions` (
 	`eve_session_id` text,
 	`eve_continuation_token` text,
 	`local_session_ref` text,
-	`stream_index` integer DEFAULT 0 NOT NULL,
-	`pending_user_message` text,
-	`pending_user_message_created_at` integer,
 	`created_at` integer NOT NULL,
 	`last_active_at` integer NOT NULL,
 	`deleted_at` integer

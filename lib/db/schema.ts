@@ -56,6 +56,9 @@ export const sessions = sqliteTable('sessions', {
   eveSessionId: text('eve_session_id'),                        // eveagent 专用
   eveContinuationToken: text('eve_continuation_token'),        // eveagent 专用
   localSessionRef: text('local_session_ref'),                  // 本地 client 内部 ID
+  streamIndex: integer('stream_index').notNull().default(0),   // eve stream resume 游标
+  pendingUserMessage: text('pending_user_message'),            // 已提交但 turn 未完成的消息内容
+  pendingUserMessageCreatedAt: integer('pending_user_message_created_at', { mode: 'timestamp' }), // pending 写入时刻,stale 判断用
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   lastActiveAt: integer('last_active_at', { mode: 'timestamp' }).notNull(),
   deletedAt: integer('deleted_at', { mode: 'timestamp' }),

@@ -12,6 +12,7 @@ export interface WebtoolMessageMetadata {
   usage?: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number };
   cost?: number;
   finishReason?: 'stop' | 'interrupted' | 'error' | 'length' | 'tool-calls' | string;
+  optimistic?: boolean;  // T-013:乐观 user 消息标记(send 插入,assistant part.start 清除)
 }
 
 // 落库 part 类型:UIMessagePart + 私有 _pid(persist 注入,ai-elements 渲染忽略未知字段)

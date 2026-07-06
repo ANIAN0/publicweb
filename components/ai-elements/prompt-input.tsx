@@ -958,11 +958,21 @@ export const PromptInputTextarea = ({
   onKeyDown,
   className,
   placeholder = "What would you like to know?",
+  autoFocus,  // T-012:ready 时 rAF focus
   ...props
-}: PromptInputTextareaProps) => {
+}: PromptInputTextareaProps & { autoFocus?: boolean }) => {
   const controller = useOptionalPromptInputController();
   const attachments = usePromptInputAttachments();
   const [isComposing, setIsComposing] = useState(false);
+  // T-012:ready 时 rAF focus textarea(对齐 template,autoFocus prop 控制)
+  useEffect(() => {
+    if (autoFocus) {
+      const id = requestAnimationFrame(() => {
+        document.querySelector<HTMLTextAreaElement>("textarea")?.focus();
+      });
+      return () => cancelAnimationFrame(id);
+    }
+  }, [autoFocus]);
 
   const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = useCallback(
     (e) => {
@@ -1087,17 +1097,24 @@ export const PromptInputHeader = ({
 export type PromptInputFooterProps = Omit<
   ComponentProps<typeof InputGroupAddon>,
   "align"
->;
+> & {
+  footerStart?: ReactNode;  // T-012:左侧槽位(预留附件/工具按钮位)
+};
 
 export const PromptInputFooter = ({
   className,
+  footerStart,  // T-012
+  children,
   ...props
 }: PromptInputFooterProps) => (
   <InputGroupAddon
     align="block-end"
     className={cn("justify-between gap-1", className)}
     {...props}
-  />
+  >
+    {footerStart}
+    {children}
+  </InputGroupAddon>
 );
 
 export type PromptInputToolsProps = HTMLAttributes<HTMLDivElement>;
@@ -1207,6 +1224,7 @@ export const PromptInputActionMenuItem = ({
 export type PromptInputSubmitProps = ComponentProps<typeof InputGroupButton> & {
   status?: ChatStatus;
   onStop?: () => void;
+  disabledReason?: string;  // T-012:disabled 时 title 提示禁用原因
 };
 
 export const PromptInputSubmit = ({
@@ -1217,6 +1235,7 @@ export const PromptInputSubmit = ({
   onStop,
   onClick,
   children,
+  disabledReason,  // T-012
   ...props
 }: PromptInputSubmitProps) => {
   const isGenerating = status === "submitted" || status === "streaming";
@@ -1249,6 +1268,7 @@ export const PromptInputSubmit = ({
       className={cn(className)}
       onClick={handleClick}
       size={size}
+      title={disabledReason}  // T-012:disabled 时 title 提示禁用原因(原生 tooltip)
       type={isGenerating && onStop ? "button" : "submit"}
       variant={variant}
       {...props}

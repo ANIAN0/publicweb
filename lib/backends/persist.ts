@@ -76,6 +76,8 @@ export async function persistSessionEvent(sessionId: string, event: WebtoolEvent
   try {
     if (event.type === 'part.start') {
       const cur = await getOrCreateCurrentAssistant(sessionId);
+      // 兜底去重:partId 已存在则跳过(防 resume 崩溃窗口重复追回 / 并发导致 parts 重复段)
+      if (findPartIndex(cur.parts, event.partId) >= 0) return;
       // 注入 _pid(供后续 part.delta/update 定位),挂到 parts 末尾保序
       const part: PersistedPart = { ...event.part, _pid: event.partId } as PersistedPart;
       cur.parts.push(part);

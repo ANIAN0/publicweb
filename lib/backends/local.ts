@@ -121,7 +121,8 @@ export class LocalBackend implements BackendAdapter {
     this.sessionUnsubscribers.delete(sessionId);
   }
 
-  onEvent(sessionId: string, cb: (e: WebtoolEvent) => void): () => void {
+  onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId?: number) => void, sinceEventId?: number): () => void {
+    // LocalBackend 忽略 sinceEventId(sessionEventBus 无缓冲回放,保持现状);cb 签名兼容(eventId 传 undefined)
     return sessionEventBus.subscribe(sessionId, cb);
   }
 }

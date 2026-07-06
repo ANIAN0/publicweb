@@ -1,11 +1,12 @@
 import { Client, MessageResponse } from 'eve/client';
 import { BackendAdapter, ChatMessage, ExecutionTarget } from './types';
 import { WebtoolEvent, type WebtoolMessageMetadata, type InputResponse } from '../protocol/events';
-import { EventBus } from './event-bus';
+import { eventBus } from './event-bus';
 import { getDb } from '../db/client';
 import { sessions, messages, eveServices } from '../db/schema';
 import { eq, and, asc, desc } from 'drizzle-orm';
 import { persistSessionEvent, extractTextFromParts } from './persist';
+import { isPendingStale } from './pending';
 import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
@@ -20,8 +21,6 @@ function eveLog(msg: string): void {
     appendFileSync(join(dir, `eve-${day}.log`), `${ts} [eve] ${msg}\n`, 'utf8');
   } catch { /* 日志失败不影响主流程 */ }
 }
-
-const eventBus = new EventBus();
 
 // 剥离 action,只保留前端 UI 可见的 inputRequest 字段(对齐 eve client toMessageInputRequest)
 // 前端 InputRequestCard 据此渲染:prompt 问题文案 + display 三态 + options 选项 + allowFreeform 自定义文本
@@ -62,6 +61,8 @@ export class EveagentBackend implements BackendAdapter {
   private turnChain = new Map<string, Promise<void>>();
   // Per-session AbortController：send 时建一个，stop 时 abort()，runTurn 结束后清理
   private abortControllers = new Map<string, AbortController>();
+  // Per-session resume 锁:resume 进行中标记,防 SSE 重连触发并发 resume 重复追回(HIGH-1 防并发精神延伸)
+  private resuming = new Set<string>();
   // 当前 turn 状态:turnId 用于 partId 合成(${turnId}:${stepIndex}:type),startedParts 记录已 part.start 的 partId(避免重复 start),turnEnded 去重边界事件
   private turnState = new Map<string, { turnId: string | null; startedParts: Set<string>; turnEnded: boolean }>();
 
@@ -165,14 +166,18 @@ export class EveagentBackend implements BackendAdapter {
     const [sessRow] = await db.select({
       eveSessionId: sessions.eveSessionId,
       eveContinuationToken: sessions.eveContinuationToken,
+      streamIndex: sessions.streamIndex,
     }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
+    // streamIndex 从 db 读(替代硬编码 0):eve client #createEventStream 用 state.streamIndex 作 startIndex 续接(session.ts:166)
     const sessionState = sessRow?.eveSessionId
-      ? { sessionId: sessRow.eveSessionId, continuationToken: sessRow.eveContinuationToken ?? undefined, streamIndex: 0 }
+      ? { sessionId: sessRow.eveSessionId, continuationToken: sessRow.eveContinuationToken ?? undefined, streamIndex: sessRow.streamIndex ?? 0 }
       : undefined;
     if (sessionState) {
-      eveLog(`resume sid=${sessionId} eveSessionId=${sessionState.sessionId} hasToken=${sessionState.continuationToken !== undefined} inputResponsesLen=${inputResponses?.length ?? 0}`);
+      eveLog(`resume sid=${sessionId} eveSessionId=${sessionState.sessionId} hasToken=${sessionState.continuationToken !== undefined} streamIndex=${sessionState.streamIndex} inputResponsesLen=${inputResponses?.length ?? 0}`);
     }
     const clientSession = client.session(sessionState);
+    // eventCount 对齐 eve client currentStreamIndex(session.ts:182):从 db streamIndex 起始,每消费一个 eve event +1
+    let eventCount = sessRow?.streamIndex ?? 0;
 
     const clientContext = history.length > 0
       ? JSON.stringify(history.map((m) => ({ role: m.role, content: m.content })))
@@ -209,11 +214,12 @@ export class EveagentBackend implements BackendAdapter {
     try {
       for await (const event of response) {
         if (signal.aborted) break;
+        eventCount += 1;  // 每消费一个 eve event +1(对齐 eve client currentStreamIndex += 1,session.ts:182)
         // [eve] 记录每个流式事件的 type + data 顶层字段名（截断防刷屏）
         // event 是 HandleMessageStreamEvent 联合,部分成员(如 SessionCompletedStreamEvent)无 data,用 narrowing
         const eventData = 'data' in event ? (event as { data?: Record<string, unknown> }).data : undefined;
         const dataKeys = eventData ? Object.keys(eventData).join(',') : '-';
-        eveLog(`event sid=${sessionId} type=${event?.type} dataKeys=${dataKeys}`);
+        eveLog(`event sid=${sessionId} type=${event?.type} dataKeys=${dataKeys} eventCount=${eventCount}`);
         // 一个 eve 事件可能映射出多个 WebtoolEvent(actions.requested 遍历、message.appended 先 start 再 delta)
         const webtoolEvents = this.mapEveEventToWebtoolEvent(event, sessionId);
         if (webtoolEvents.length === 0) {
@@ -221,19 +227,51 @@ export class EveagentBackend implements BackendAdapter {
           eveLog(`event unmapped sid=${sessionId} type=${event?.type} -> skip`);
           continue;
         }
+        let hasPartEnd = false;  // 是否含 part.end(折中粒度更新 db streamIndex 的触发点)
         for (const we of webtoolEvents) {
           eveLog(`event mapped sid=${sessionId} eveType=${event?.type} -> webtoolType=${we.type}`);
           eventBus.emit(sessionId, we);
           await persistSessionEvent(sessionId, we);
+          if (we.type === 'part.end') hasPartEnd = true;
+        }
+        // 每 part.end 更新 db streamIndex(折中粒度缩小崩溃窗口,对齐 template advanceBrowserSession;崩溃窗口靠 T-006 _pid 去重兜底)
+        if (hasPartEnd) {
+          await db.update(sessions).set({ streamIndex: eventCount }).where(eq(sessions.id, sessionId));
+          eveLog(`streamIndex advance sid=${sessionId} streamIndex=${eventCount}`);
         }
       }
       // [eve] 流正常结束
-      eveLog(`stream end sid=${sessionId} aborted=${signal.aborted}`);
+      eveLog(`stream end sid=${sessionId} aborted=${signal.aborted} streamIndex=${eventCount}`);
+      // turn 正常结束(非 abort)写回最终 streamIndex + 清 pending;abort 路径在下方单独写
+      if (!signal.aborted) {
+        await db.update(sessions).set({
+          streamIndex: eventCount,
+          pendingUserMessage: null,
+          pendingUserMessageCreatedAt: null,
+        }).where(eq(sessions.id, sessionId));
+      }
     } catch (err: any) {
       // [eve] 记录异常：名字 + 消息，判断是 abort 还是真错误
       eveLog(`error sid=${sessionId} name=${err?.name} msg=${err?.message} aborted=${signal.aborted}`);
-      // signal 触发 abort 时，eve client 可能抛出 AbortError；视为正常停止
-      if (err?.name !== 'AbortError' && !signal.aborted) throw err;
+      // 非 abort 异常:emit+persist turn.completed(error) 解前端 isSending
+      // (原 throw 被 send.catch 吞(:128-132)不写 turn.completed,前端 use-session-messages.ts:199-203 依赖 turn.completed 解开 → 卡死)
+      if (err?.name !== 'AbortError' && !signal.aborted) {
+        const errorEvent = {
+          type: 'turn.completed' as const,
+          finishReason: 'error' as const,
+          error: { code: err?.name ?? 'unknown', message: err?.message ?? String(err) },
+        };
+        eventBus.emit(sessionId, errorEvent);
+        await persistSessionEvent(sessionId, errorEvent);
+        // 异常收尾写回最终 streamIndex + 清 pending
+        await db.update(sessions).set({
+          streamIndex: eventCount,
+          pendingUserMessage: null,
+          pendingUserMessageCreatedAt: null,
+        }).where(eq(sessions.id, sessionId));
+        eveLog(`turn error completed sid=${sessionId} streamIndex=${eventCount}`);
+        throw err;
+      }
     }
 
     // 主动停止：写最后一条 assistant 消息的 finishReason='interrupted'，
@@ -242,6 +280,12 @@ export class EveagentBackend implements BackendAdapter {
       await this.markInterrupted(sessionId);
       eventBus.emit(sessionId, { type: 'turn.completed', finishReason: 'interrupted' });
       await persistSessionEvent(sessionId, { type: 'turn.completed', finishReason: 'interrupted' });
+      // abort 收尾写回最终 streamIndex + 清 pending
+      await db.update(sessions).set({
+        streamIndex: eventCount,
+        pendingUserMessage: null,
+        pendingUserMessageCreatedAt: null,
+      }).where(eq(sessions.id, sessionId));
     }
   }
 
@@ -271,14 +315,164 @@ export class EveagentBackend implements BackendAdapter {
     // 清理工作交给 send 的 .finally 收尾；这里不立即 delete 以避免竞态
   }
 
-  onEvent(sessionId: string, cb: (e: WebtoolEvent) => void): () => void {
-    return eventBus.subscribe(sessionId, cb);
+  onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId?: number) => void, sinceEventId?: number): () => void {
+    return eventBus.subscribe(sessionId, cb, sinceEventId);
+  }
+
+  /**
+   * resume(BackendAdapter.resume 实现):reload 后追回崩溃窗口遗漏的 eve 事件(REV-001 HIGH-1 三层兜底之一)。
+   * 触发:SSE 连接时(events/route.ts start)调 adapter.resume?.(sessionId, signal)。
+   * 防重复三层:
+   *   1. abortControllers.has → turn 正在跑(已在 emit 实时事件给 EventBus,SSE subscribe 即收到),不 resume 防并发重复订阅导致 part.delta 重复累加
+   *   2. open turn 检查(最后 assistant finishReason 未定 OR pending 非 stale,复用 T-005 isPendingStale)→ 非 open 不 resume
+   *   3. _pid 幂等去重(已落库 partId 跳过 persist)+ persist.ts part.start 兜底去重(T-006 步骤 4)
+   * 追回:client.session(state).stream({startIndex: db streamIndex, signal}) 重订阅,boundary 后停止(步骤 5)。
+   */
+  async resume(sessionId: string, signal: AbortSignal): Promise<void> {
+    // HIGH-1:turn 正在跑(abortControllers 有值)→ 已在 emit 实时事件给 EventBus,SSE subscribe 即收到,不 resume
+    if (this.abortControllers.has(sessionId)) {
+      eveLog(`resume skip sid=${sessionId} reason=turn-running`);
+      return;
+    }
+    // 防并发 resume:SSE 重连可能触发第二次 resume(resuming 有值)→ 跳过,靠 eventBus 缓冲回放补事件
+    if (this.resuming.has(sessionId)) {
+      eveLog(`resume skip sid=${sessionId} reason=already-resuming`);
+      return;
+    }
+    this.resuming.add(sessionId);
+    try {
+      await this.doResume(sessionId, signal);
+    } finally {
+      this.resuming.delete(sessionId);
+    }
+  }
+
+  // 实际 resume 追回逻辑(由 resume 加锁后调用)
+  private async doResume(sessionId: string, signal: AbortSignal): Promise<void> {
+    const db = await getDb();
+    // 读 db session state(eveSessionId, continuationToken, streamIndex, pendingUserMessage)
+    const [sessRow] = await db.select({
+      eveSessionId: sessions.eveSessionId,
+      eveContinuationToken: sessions.eveContinuationToken,
+      streamIndex: sessions.streamIndex,
+      pendingUserMessage: sessions.pendingUserMessage,
+    }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
+
+    // 无 eve session(尚未 send 过)→ 无法 resume
+    if (!sessRow?.eveSessionId) {
+      eveLog(`resume skip sid=${sessionId} reason=no-eve-session`);
+      return;
+    }
+
+    // 读最后一条 assistant 消息:finishReason(open turn 判定)+ parts _pid 集合(幂等去重)
+    const [lastAssistant] = await db.select({ metadata: messages.metadata, parts: messages.parts })
+      .from(messages)
+      .where(and(eq(messages.sessionId, sessionId), eq(messages.role, 'assistant')))
+      .orderBy(desc(messages.seq))
+      .limit(1);
+
+    let finishReason: unknown = undefined;
+    const existingPartIds = new Set<string>();
+    if (lastAssistant) {
+      try {
+        const meta = lastAssistant.metadata ? JSON.parse(lastAssistant.metadata) : {};
+        finishReason = meta?.finishReason;
+      } catch { /* 损坏元数据当空 */ }
+      try {
+        const parts = lastAssistant.parts ? JSON.parse(lastAssistant.parts) : [];
+        if (Array.isArray(parts)) {
+          for (const p of parts) {
+            const pid = (p as { _pid?: string })._pid;
+            if (pid) existingPartIds.add(pid);
+          }
+        }
+      } catch { /* 损坏 parts 当空 */ }
+    }
+
+    // open turn 判定:最后 assistant finishReason 未定 OR pending 非 stale(复用 T-005 isPendingStale)
+    const openByAssistant = finishReason === undefined;
+    const pendingNonStale = sessRow.pendingUserMessage !== null && !(await isPendingStale(sessionId));
+    if (!openByAssistant && !pendingNonStale) {
+      eveLog(`resume skip sid=${sessionId} reason=not-open-turn finishReason=${String(finishReason)}`);
+      return;
+    }
+
+    // 取 host + client(对齐 runTurn getClient 缓存)
+    let host = this.sessionToHost.get(sessionId);
+    if (!host) {
+      host = await this.lookupHost(sessionId);
+      if (host) this.sessionToHost.set(sessionId, host);
+    }
+    if (!host) {
+      eveLog(`resume skip sid=${sessionId} reason=no-host`);
+      return;
+    }
+    const client = this.getClient(host);
+
+    const streamIndex = sessRow.streamIndex ?? 0;
+    // sessionState 喂 client.session:eve client #streamAndAdvance 用 startIndex 覆盖 state.streamIndex 追回
+    const sessionState = {
+      sessionId: sessRow.eveSessionId,
+      continuationToken: sessRow.eveContinuationToken ?? undefined,
+      streamIndex,
+    };
+    const clientSession = client.session(sessionState);
+
+    eveLog(`resume start sid=${sessionId} eveSessionId=${sessionState.sessionId} streamIndex=${streamIndex} existingPartIds=${existingPartIds.size} openByAssistant=${openByAssistant} pendingNonStale=${pendingNonStale}`);
+
+    // 重订阅追回:stream({startIndex, signal}) 从 db streamIndex 追回
+    // openStreamIterable yield 所有事件直到流关闭,不在 boundary 自动停 → resume 自己 break(步骤 5)
+    let eventCount = streamIndex;
+    try {
+      for await (const event of clientSession.stream({ startIndex: streamIndex, signal })) {
+        if (signal.aborted) break;
+        eventCount += 1;  // 对齐 runTurn eventCount 语义(每消费一个 eve event +1)
+        const webtoolEvents = this.mapEveEventToWebtoolEvent(event, sessionId);
+        if (webtoolEvents.length === 0) continue;
+        let hasPartEnd = false;
+        let isBoundary = false;
+        for (const we of webtoolEvents) {
+          // _pid 幂等去重:part.* 事件,partId 已在 db parts 集合则跳过 persist
+          // (防崩溃窗口重复追回已落库事件导致 parts 重复段 / text 重复累加)
+          if (we.type === 'part.start' || we.type === 'part.delta' || we.type === 'part.update' || we.type === 'part.end') {
+            if (existingPartIds.has(we.partId)) {
+              eveLog(`resume dedup sid=${sessionId} partId=${we.partId} type=${we.type} -> skip persist`);
+              continue;
+            }
+          }
+          eventBus.emit(sessionId, we);
+          await persistSessionEvent(sessionId, we);
+          // 新 part.start 记入集合:防本 turn 后续 delta/update/end 重复 persist(同 partId)
+          if (we.type === 'part.start') existingPartIds.add(we.partId);
+          if (we.type === 'part.end') hasPartEnd = true;
+          if (we.type === 'turn.completed') isBoundary = true;
+        }
+        // 每 part.end 更新 db streamIndex(对齐 T-003 推进语义,缩小再次崩溃窗口)
+        if (hasPartEnd) {
+          await db.update(sessions).set({ streamIndex: eventCount }).where(eq(sessions.id, sessionId));
+        }
+        // boundary 后停止追回(步骤 5):turn.completed/failed/session.waiting 映射出的 turn.completed
+        if (isBoundary) {
+          eveLog(`resume boundary stop sid=${sessionId} streamIndex=${eventCount}`);
+          break;
+        }
+      }
+      // 追回结束写回最终 streamIndex
+      await db.update(sessions).set({ streamIndex: eventCount }).where(eq(sessions.id, sessionId));
+      eveLog(`resume end sid=${sessionId} streamIndex=${eventCount} aborted=${signal.aborted}`);
+    } catch (err: any) {
+      // resume 失败不抛(SSE 触发,抛了污染 SSE 响应);记日志即可
+      // 不写 turn.completed:resume 失败可能是网络瞬断,turn 实际可能还在跑,误写会 prematurely 结束 turn
+      eveLog(`resume error sid=${sessionId} name=${err?.name} msg=${err?.message}`);
+    }
   }
 
   private getClient(host: string): Client {
     let client = this.clients.get(host);
     if (!client) {
-      client = new Client({ host });
+      // 显式配置 maxReconnectAttempts:3——eve client #createEventStream(session.ts:157-221)已内置 stream 级断线重连
+      // (isStreamDisconnectError 识别断线错误,用 currentStreamIndex 续接 openStreamBody);webtool 不外包 for await 重连(死代码,见 LOG-003)
+      client = new Client({ host, maxReconnectAttempts: 3 });
       this.clients.set(host, client);
     }
     return client;
@@ -448,6 +642,114 @@ export class EveagentBackend implements BackendAdapter {
       return out;
     }
 
+    // subagent.event:子 agent 流式事件(data.event 是嵌套 HandleMessageStreamEvent,见 eve protocol/message.ts:253-260)
+    // 不直接递归 mapEveEventToWebtoolEvent——子事件的 turnState(turn.started 重置 startedParts)/turn.completed
+    // 会污染父 turn(重复结束父 assistant 消息)。改为按子事件类型映射,partId 加 sub: 前缀隔离避免与父 part 冲突
+    if (t === 'subagent.event' && d.event) {
+      const sub = d.event;
+      const subType = sub.type;
+      const subCallId = d.callId;
+      const subName = d.subagentName ?? 'subagent';
+      // 子事件含工具调用 → dynamic-tool part(对齐父 actions.requested 投影)
+      if (subType === 'actions.requested' && Array.isArray(sub.data?.actions)) {
+        for (const action of sub.data.actions) {
+          if (!action?.callId) continue;
+          const partId = `sub:${subCallId}:${action.callId}`;
+          out.push({
+            type: 'part.start', partId,
+            part: {
+              type: 'dynamic-tool',
+              toolName: action.toolName ?? action.name ?? `subagent:${subName}`,
+              toolCallId: action.callId,
+              state: 'input-available',
+              input: action.input ?? {},
+            },
+          });
+          st.startedParts.add(partId);
+        }
+        return out;
+      }
+      // 子事件 text/reasoning 增量或完成 → reasoning part(累积子 agent 推理/文本,标记子 agent 活动)
+      if (typeof subType === 'string' && (subType.startsWith('message.') || subType.startsWith('reasoning.'))) {
+        const partId = `sub:${subCallId}:reasoning`;
+        // 子事件完成 → 结束 reasoning part
+        if (subType.endsWith('.completed')) {
+          if (st.startedParts.has(partId)) {
+            out.push({ type: 'part.end', partId, part: { type: 'reasoning', text: '', state: 'done' } });
+          }
+          return out;
+        }
+        // 子事件增量 → part.delta(首次先 part.start 带子 agent 名前缀)
+        const delta = sub.data?.messageDelta ?? sub.data?.reasoningDelta ?? '';
+        if (delta) {
+          if (!st.startedParts.has(partId)) {
+            out.push({ type: 'part.start', partId, part: { type: 'reasoning', text: `[子 agent ${subName}]\n`, state: 'streaming' } });
+            st.startedParts.add(partId);
+          }
+          out.push({ type: 'part.delta', partId, field: 'reasoning', delta });
+        }
+        return out;
+      }
+      // 子边界事件(turn.*/session.*/step.*)不映射,避免重复 turn.completed 结束父 turn
+      return out;
+    }
+
+    // compaction.requested/completed:上下文压缩提示(eve reducer 不投影,webtool 加 reasoning 折叠提示让用户感知)
+    // 一 turn 一个 compaction reasoning part(turnId:compaction),startedParts 去重
+    if (t === 'compaction.requested' || t === 'compaction.completed') {
+      const partId = `${d.turnId ?? st.turnId}:compaction`;
+      if (!st.startedParts.has(partId)) {
+        out.push({ type: 'part.start', partId, part: { type: 'reasoning', text: '上下文已压缩', state: 'done' } });
+        st.startedParts.add(partId);
+      }
+      return out;
+    }
+
+    // authorization.required:权限授权请求(eve 用 authorization part,webtool 统一用 dynamic-tool+approval 对齐 input.requested 语义)
+    // partId=${turnId}:${stepIndex}:auth:${name},对齐 eve partKey(authorization:turnId:stepIndex:name,见 message-reducer.ts:508)
+    if (t === 'authorization.required') {
+      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:auth:${d.name}`;
+      out.push({
+        type: 'part.start', partId,
+        part: {
+          type: 'dynamic-tool',
+          toolName: `auth:${d.name}`,
+          toolCallId: partId,
+          state: 'approval-requested',
+          input: { description: d.description, name: d.name },
+          approval: { id: partId },
+          toolMetadata: { eve: { kind: 'authorization', name: d.name } },
+        },
+      });
+      st.startedParts.add(partId);
+      return out;
+    }
+
+    // authorization.completed:授权结果(authorized→output-available / declined/failed/timed-out→output-denied)
+    if (t === 'authorization.completed') {
+      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:auth:${d.name}`;
+      const outcome = d.outcome;
+      out.push({
+        type: 'part.update', partId,
+        patch: {
+          state: outcome === 'authorized' ? 'output-available' : 'output-denied',
+          output: outcome,
+          approval: { id: partId, approved: outcome === 'authorized', reason: d.reason },
+        },
+      });
+      return out;
+    }
+
+    // result.completed:结构化输出(eve reducer 投影到 metadata.result,见 message-reducer.ts:263-264;
+    // webtool WebtoolMessageMetadata 无 result 字段且不改 events.ts,映射为 text part 显示最终结构化输出)
+    if (t === 'result.completed') {
+      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex ?? 0}:result`;
+      out.push({ type: 'part.start', partId, part: { type: 'text', text: '', state: 'streaming' } });
+      out.push({ type: 'part.end', partId, part: { type: 'text', text: JSON.stringify(d.result ?? ''), state: 'done' } });
+      st.startedParts.add(partId);
+      return out;
+    }
+
     // 边界事件:turn.completed/failed/session.waiting/completed/failed(去重,首个边界发 turn.completed)
     const isBoundary = t === 'turn.completed' || t === 'turn.failed' || t === 'session.waiting' || t === 'session.completed' || t === 'session.failed';
     if (isBoundary) {
@@ -466,6 +768,6 @@ export class EveagentBackend implements BackendAdapter {
       return out;
     }
 
-    return out; // 其他事件(step.started/message.received/compaction.*/subagent.*/authorization.*/result.completed)暂未映射
+    return out; // step.started(无 UI 可见信息,stepIndex 已在后续事件 data 里)/message.received(D-005:user 消息由 POST /messages 落库为权威源,映射会重复)暂未映射
   }
 }

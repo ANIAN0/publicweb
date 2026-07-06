@@ -40,12 +40,30 @@ function getOrCreateCurrentAssistant(
   return { messages: [...messages, newMsg], current: newMsg };
 }
 
+// 清除最后一条 optimistic user 消息的乐观标记(保留消息内容,assistant part.start 触发,REV-001 MEDIUM-1 确认方向)
+// 倒序找最后一条 optimistic user(跳过 assistant);找到则 optimistic=false(opacity 恢复正常)
+function clearLastOptimistic(messages: FrontendMessage[]): FrontendMessage[] {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'user') continue;  // 跳过 assistant
+    if (m.metadata?.optimistic) {
+      return messages.map((mm, idx) =>
+        idx === i ? { ...mm, metadata: { ...mm.metadata, optimistic: false } } : mm
+      );
+    }
+    break;  // 遇到非 optimistic user 停止(只清最后一条)
+  }
+  return messages;
+}
+
 // 把一条 WebtoolEvent 应用到 messages,返回新数组(不可变更新,触发 React 重渲染)
 // 逻辑镜像 persist.persistSessionEvent(part.start/delta/update/end + message.metadata + turn.completed)
 function applyEvent(messages: FrontendMessage[], event: WebtoolEvent): FrontendMessage[] {
   switch (event.type) {
     case 'part.start': {
-      const { messages: m1, current } = getOrCreateCurrentAssistant(messages);
+      // assistant part.start:清除最后一条 optimistic user 消息的乐观标记(保留消息内容,REV-001 MEDIUM-1)
+      const cleared = clearLastOptimistic(messages);
+      const { messages: m1, current } = getOrCreateCurrentAssistant(cleared);
       // 注入 _pid(供后续 part.delta/update 定位),挂到 parts 末尾保序
       const part: PersistedPart = { ...event.part, _pid: event.partId } as PersistedPart;
       return m1.map((m) => (m === current ? { ...m, parts: [...m.parts, part] } : m));
@@ -115,6 +133,8 @@ function applyEvent(messages: FrontendMessage[], event: WebtoolEvent): FrontendM
 export interface UseSessionMessagesResult {
   messages: FrontendMessage[];
   sending: boolean;
+  resuming: boolean;
+  sendError: string | null;
   disconnected: boolean;
   disconnectReason?: string;
   send: (content: string) => Promise<void>;
@@ -130,23 +150,37 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
   const [sending, setSending] = useState(false);
   const [disconnected, setDisconnected] = useState(false);
   const [disconnectReason, setDisconnectReason] = useState<string | undefined>();
+  // reload 续接:lastEventId 记录最后收到的 SSE 事件 id(EventSource 自动重连带 Last-Event-ID 头;
+  // React remount/retry 新建 EventSource 时带 ?since=lastEventId 回放缓冲);reload 后内存丢失靠后端 resume(T-006)+ GET 全量兜底
+  const lastEventIdRef = useRef<number | null>(null);
+  // 恢复中反馈:reload 后 open turn 恢复 sending 时置 true,收到首个 turn 事件后置 false
+  const [resuming, setResuming] = useState(false);
+  // 标记本轮 useEffect 是否已收到 turn 事件(防 fetch 与 EventSource 竞态:fetch 后 setResuming(true) 若已收到事件则跳过)
+  const receivedEventRef = useRef(false);
+  // send 失败/超时反馈(T-012):用户可见提示,非仅 console.warn
+  const [sendError, setSendError] = useState<string | null>(null);
 
   // 加载历史 + 订阅 SSE
   useEffect(() => {
     let cancelled = false;
+    receivedEventRef.current = false;  // 新 useEffect 重置(remount/retry 重新等首个事件)
     // 加载历史:db rows(parts/metadata JSON 字符串)→ UIMessage[]
     fetch(`/api/sessions/${sessionId}/messages`)
       .then((res) => res.json())
       .then(
-        (
-          rows: Array<{
+        (data: {
+          messages: Array<{
             id: string;
             role: string;
             parts: string;
             metadata: string | null;
-          }>
-        ) => {
+          }>;
+          pendingUserMessage: string | null;
+        }) => {
           if (cancelled) return;
+          // T-005 GET 返回 {messages, pendingUserMessage};适配新结构(原数组解析会 break)
+          const rows = data.messages;
+          const pendingUserMessage = data.pendingUserMessage;
           // 安全解析 JSON 列;空/损坏按空兜底,避免渲染崩溃
           const msgs: FrontendMessage[] = rows.map((r) => {
             let parts: PersistedPart[] = [];
@@ -172,19 +206,41 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
             };
           });
           setMessages(msgs);
+          // reload 续接:open turn(最后 assistant finishReason 未定)或有未过期 pendingUserMessage → 恢复 sending + 显示"恢复中"
+          // 后端 resume(T-006)会追回遗漏事件推 SSE,turn.completed 到达后自然解开 sending
+          let lastAssistant: FrontendMessage | undefined;
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].role === 'assistant') {
+              lastAssistant = msgs[i];
+              break;
+            }
+          }
+          const openTurn = lastAssistant !== undefined && lastAssistant.metadata?.finishReason === undefined;
+          // 已收到事件(EventSource 先于 fetch 完成)则不置 resuming,避免竞态卡在"恢复中"
+          if ((openTurn || pendingUserMessage !== null) && !receivedEventRef.current) {
+            setSending(true);
+            setResuming(true);
+          }
         }
       );
 
     // 订阅 SSE:part.* 增量累积成 UIMessage
-    const es = new EventSource(`/api/sessions/${sessionId}/events`);
+    // URL 带 ?since=lastEventId(React remount/retry 新建时回放缓冲;EventSource 自动重连带 Last-Event-ID 头后端 T-004 也读)
+    const eventUrl = `/api/sessions/${sessionId}/events${lastEventIdRef.current !== null ? `?since=${lastEventIdRef.current}` : ''}`;
+    const es = new EventSource(eventUrl);
     es.onmessage = (ev) => {
+      // 更新 lastEventId(EventSource 自动解析后端发的 id: 行为 ev.lastEventId;非数字/空不更新)
+      const lidStr = ev.lastEventId;
+      if (lidStr !== '' && /^\d+$/.test(lidStr)) {
+        lastEventIdRef.current = Number(lidStr);
+      }
       let event: WebtoolEvent;
       try {
         event = JSON.parse(ev.data);
       } catch {
         return; // 非 JSON 事件忽略
       }
-      // 会话级事件单独处理(不进 messages)
+      // 会话级事件单独处理(不进 messages,不解除 resuming——它们非 turn 事件)
       if (event.type === 'session.disconnected') {
         setDisconnected(true);
         setDisconnectReason(event.reason);
@@ -195,6 +251,9 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
         setDisconnectReason(undefined);
         return;
       }
+      // 收到 turn 事件(part.*/message.metadata/turn.completed):resume 已开始推送,解除"恢复中"
+      receivedEventRef.current = true;
+      setResuming(false);
       // turn.completed:累积 + 解开 sending
       if (event.type === 'turn.completed') {
         setMessages((prev) => applyEvent(prev, event));
@@ -215,11 +274,13 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
     async (content: string) => {
       if (!content.trim() || sending) return;
       setSending(true);
-      // 乐观插入 user 消息(前端立即显示,不等 db 回写)
+      setSendError(null);  // 清除上次错误(T-012)
+      // 乐观插入 user 消息(前端立即显示,不等 db 回写);带 optimistic 标记(对齐 template createPendingUserMessage;webtool UIMessage 无 status 字段,只加 optimistic)
       const userMsg: FrontendMessage = {
         id: `user-${Date.now()}`,
         role: 'user',
         parts: [{ type: 'text', text: content }],
+        metadata: { optimistic: true },  // T-013:乐观标记(assistant part.start 清除)
       };
       setMessages((prev) => [...prev, userMsg]);
 
@@ -238,11 +299,13 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
         ]);
         if (!res.ok) {
           setSending(false);
+          setSendError(`发送失败:${res.status}`);  // T-012 用户可见反馈
           console.warn(`send failed: ${res.status}`);
         }
         // res.ok 时 turn.completed 会通过 SSE 到达并 setSending(false)
       } catch {
         setSending(false);
+        setSendError('发送失败:网络或超时');  // T-012 用户可见反馈
         console.warn('send network/timeout error');
       }
     },
@@ -323,5 +386,5 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
     [sessionId]
   );
 
-  return { messages, sending, disconnected, disconnectReason, send, stop, retry, dismissDisconnected, respondInput };
+  return { messages, sending, resuming, sendError, disconnected, disconnectReason, send, stop, retry, dismissDisconnected, respondInput };
 }

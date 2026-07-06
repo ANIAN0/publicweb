@@ -32,7 +32,9 @@ export interface BackendAdapter extends BackendDescriptor {
   /** 主动停止当前 turn（不 kill agent 进程） */
   stop(sessionId: string): Promise<void>;
   /** 订阅一个 session 的事件 */
-  onEvent(sessionId: string, cb: (e: WebtoolEvent) => void): () => void;
+  onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId?: number) => void, sinceEventId?: number): () => void;
+  /** reload 后追回崩溃窗口遗漏事件(eveagent 实现,local 无);SSE 连接时触发 */
+  resume?(sessionId: string, signal: AbortSignal): Promise<void>;
   // 预留:per-target 模型切换(内嵌 eveagent 改文件重启场景),当前不实现,场景来时加
   // switchModel?(targetId: string, model: string): Promise<void>;
 }

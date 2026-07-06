@@ -22,7 +22,7 @@ export function InterruptBanner({ open, reason, busy, onRetry, onDismiss }: Inte
       <div className="flex items-center gap-2 text-sm text-yellow-900 dark:text-yellow-200">
         <span>⚠</span>
         <span>
-          {reason === 'device-offline' ? '设备已断开，等待重连...' : '连接已断开'}
+          {reason === 'device_offline' ? '设备已断开，等待重连...' : '连接已断开'}
         </span>
       </div>
       <div className="flex gap-2 shrink-0">

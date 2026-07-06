@@ -29,6 +29,8 @@ CREATE TABLE `eve_services` (
 	`name` text NOT NULL,
 	`host` text NOT NULL,
 	`model` text NOT NULL,
+	`auth_type` text DEFAULT 'none' NOT NULL,
+	`auth_config` text,
 	`online` integer DEFAULT false,
 	`last_seen_at` integer,
 	`created_at` integer NOT NULL

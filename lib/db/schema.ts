@@ -39,6 +39,15 @@ export const eveServices = sqliteTable('eve_services', {
   name: text('name').notNull(),                                 // 展示名 "云端 eve"
   host: text('host').notNull(),                                 // https://hunian003-evework.hf.space
   model: text('model').notNull(),                               // 该服务绑定的模型(部署者填)
+  // auth 形态:none=无认证 / bearer=Authorization: Bearer <token> / headers=自定义请求头
+  // 一个 eve 服务一套 auth,选模型=选服务时连带选 auth
+  authType: text('auth_type').notNull().default('none'),        // 'none' | 'bearer' | 'headers'
+  // auth 配置(JSON,明文存——webtool 本地运行,db 文件在用户本机,威胁模型类似本地 .env):
+  //   bearer → { token: string }
+  //   headers → { headers: Record<string,string> }
+  //   none   → null
+  // GET /api/eve-services 返回时 token 脱敏(不回显明文),PATCH 单独更新
+  authConfig: text('auth_config'),
   online: integer('online', { mode: 'boolean' }).default(false),
   lastSeenAt: integer('last_seen_at', { mode: 'timestamp' }),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),

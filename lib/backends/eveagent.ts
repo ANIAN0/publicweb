@@ -22,6 +22,24 @@ function eveLog(msg: string): void {
   } catch { /* 日志失败不影响主流程 */ }
 }
 
+// 从 db 行的 authType + authConfig 构造 eve ClientOptions 的 auth / headers(明文 token 从 authConfig JSON 读)
+//   bearer → { auth: { bearer: token } }         注入 Authorization: Bearer <token>
+//   headers → { headers: Record<string,string> } 注入自定义请求头(如 x-api-key)
+//   none   → {}                                  无认证
+// 返回结构对齐 eve ClientAuth/HeadersValue(eve client #resolveAuthHeaders/#resolveHeaders 消费)
+function buildClientOptions(authType: string, authConfig: string | null): { auth?: { bearer: string }; headers?: Record<string, string> } {
+  if (!authConfig) return {};
+  let cfg: any;
+  try { cfg = JSON.parse(authConfig); } catch { return {}; }  // 损坏配置当无 auth
+  if (authType === 'bearer' && typeof cfg?.token === 'string' && cfg.token.length > 0) {
+    return { auth: { bearer: cfg.token } };
+  }
+  if (authType === 'headers' && cfg?.headers && typeof cfg.headers === 'object') {
+    return { headers: cfg.headers as Record<string, string> };
+  }
+  return {};
+}
+
 // 剥离 action,只保留前端 UI 可见的 inputRequest 字段(对齐 eve client toMessageInputRequest)
 // 前端 InputRequestCard 据此渲染:prompt 问题文案 + display 三态 + options 选项 + allowFreeform 自定义文本
 // 注意:options 用 mutable 数组(AI SDK toolMetadata 是 JSONValue,不接受 readonly JSONArray)
@@ -53,8 +71,8 @@ export class EveagentBackend implements BackendAdapter {
   readonly label = 'Eveagent';
   readonly description = '远程云端 agent';
 
-  private clients = new Map<string, Client>();           // host → Client(已按 host 缓存,支持多服务)
-  private sessionToHost = new Map<string, string>();     // sessionId → host(startSession 记,send 取)
+  // serviceId → {client, host, authKey}:按 eve 服务缓存 Client。auth/host 变更(PATCH 后)下次 getClient 自动重建。
+  private clients = new Map<string, { client: Client; host: string; authKey: string }>();
   // Per-webtool-session serialization: queue sends so each turn's response is
   // fully consumed before the next send() goes out. The eve docs require this:
   // "send one follow-up at a time and wait for the next session.waiting event".
@@ -72,7 +90,9 @@ export class EveagentBackend implements BackendAdapter {
     // 并发探活每个服务:任何 HTTP 响应都算在线(服务在响应,即使需 auth),
     // 只有网络错误/超时才算离线
     const targets = await Promise.all(rows.map(async (svc) => {
-      const online = await this.probe(svc.host);
+      // 按 serviceId 取(或建)带 auth 的 Client,probe 走 client.fetch 自动注入 auth 头
+      const client = this.getClient(svc.id, svc.host, svc.authType, svc.authConfig);
+      const online = await this.probe(client);
       return {
         id: svc.id,
         name: svc.name,
@@ -85,12 +105,13 @@ export class EveagentBackend implements BackendAdapter {
     return targets;
   }
 
-  // 探活:fetch /info,任何 HTTP 响应 = 在线,网络错误/超时 = 离线。
+  // 探活:client.fetch /info(走 #resolveHeaders 自动注入 auth 头),任何 HTTP 响应 = 在线,网络错误/超时 = 离线。
+  // 用 client.fetch 而非 client.info():info() 校验响应体 schema,401/非 JSON 抛错;fetch 只发请求不校验,符合"任何响应=在线"。
   // 超时 10s:云端 eve(hf.space)首次请求含 DNS+TLS 握手+冷启动,2s 易误判离线
   // (实测首次 ~2s+ 超时,热连接 ~1.8s)。probe 并发(Promise.all),10s 是总上限非 N×10s。
-  private async probe(host: string): Promise<boolean> {
+  private async probe(client: Client): Promise<boolean> {
     try {
-      await fetch(`${host}/info`, { signal: AbortSignal.timeout(10000) });
+      await client.fetch('/info', { signal: AbortSignal.timeout(10000) });
       return true;
     } catch {
       return false;
@@ -98,13 +119,13 @@ export class EveagentBackend implements BackendAdapter {
   }
 
   async startSession(opts: { sessionId: string; model: string; targetId: string; history: ChatMessage[] }): Promise<void> {
-    // targetId = eve_service.id,查 host 记映射。
+    // targetId = eve_service.id,校验服务存在。
     // model 由服务端绑定(eve 不接受 client 传 model),这里仅由调用方记录到 sessions.model(展示用)。
+    // host+auth 不在此记:runTurn/resume 统一从 db 读 service 行(含 authType/authConfig),无内存映射。
     const { sessionId, targetId } = opts;
     const db = await getDb();
     const [svc] = await db.select().from(eveServices).where(eq(eveServices.id, targetId)).limit(1);
     if (!svc) throw new Error(`eve service not found: ${targetId}`);
-    this.sessionToHost.set(sessionId, svc.host);
     // 校验 session 行存在(原逻辑)
     const [session] = await db.select().from(sessions).where(eq(sessions.id, sessionId)).limit(1);
     if (!session) throw new Error(`Session ${sessionId} not found`);
@@ -118,15 +139,8 @@ export class EveagentBackend implements BackendAdapter {
     // HITL 回答(inputResponses)透传到 runTurn → clientSession.send;eve 同 session 续接(durable)
     const inputResponses = opts?.inputResponses;
 
-    // 拿 host:优先内存映射,缺失回退查 sessions.targetId → eve_services.host
-    let host = this.sessionToHost.get(sessionId);
-    if (!host) {
-      host = await this.lookupHost(sessionId);
-      if (host) this.sessionToHost.set(sessionId, host);
-    }
-    if (!host) throw new Error(`session ${sessionId} not bound to an eve service`);
-
-    const next = prev.then(() => this.runTurn(sessionId, content, controller.signal, host!, inputResponses)).catch((err) => {
+    // host+auth 由 runTurn 从 db 读 service 行获取(sessions.targetId → eve_services),无需内存映射
+    const next = prev.then(() => this.runTurn(sessionId, content, controller.signal, inputResponses)).catch((err) => {
       // abort 抛 AbortError 是预期路径，不打 ERROR 噪音
       if (err?.name !== 'AbortError') {
         console.error(`[eveagent] turn error sid=${sessionId}:`, err);
@@ -141,35 +155,32 @@ export class EveagentBackend implements BackendAdapter {
     return next;
   }
 
-  // 回退查 host:session.targetId → eve_services.host
-  private async lookupHost(sessionId: string): Promise<string | undefined> {
-    const db = await getDb();
-    const [sess] = await db.select({ targetId: sessions.targetId })
-      .from(sessions).where(eq(sessions.id, sessionId)).limit(1);
-    if (!sess?.targetId) return undefined;
-    const [svc] = await db.select({ host: eveServices.host })
-      .from(eveServices).where(eq(eveServices.id, sess.targetId)).limit(1);
-    return svc?.host ?? undefined;
-  }
-
-  private async runTurn(sessionId: string, content: string, signal: AbortSignal, host: string, inputResponses?: InputResponse[]): Promise<void> {
+  private async runTurn(sessionId: string, content: string, signal: AbortSignal, inputResponses?: InputResponse[]): Promise<void> {
     const db = await getDb();
     const history = await this.loadHistoryForContext(sessionId);
 
-    const client = this.getClient(host);
+    // 读 session 行:resume 标识 + targetId(= eve_service.id,用于取 host+auth)
+    const [sessRow] = await db.select({
+      eveSessionId: sessions.eveSessionId,
+      eveContinuationToken: sessions.eveContinuationToken,
+      streamIndex: sessions.streamIndex,
+      targetId: sessions.targetId,
+    }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
+    if (!sessRow) throw new Error(`Session ${sessionId} not found`);
+
+    // 取 eve 服务(host + auth),按 serviceId 缓存带 auth 的 Client
+    const [svc] = await db.select({ host: eveServices.host, authType: eveServices.authType, authConfig: eveServices.authConfig })
+      .from(eveServices).where(eq(eveServices.id, sessRow.targetId)).limit(1);
+    if (!svc) throw new Error(`eve service not found: ${sessRow.targetId}`);
+    const client = this.getClient(sessRow.targetId, svc.host, svc.authType, svc.authConfig);
 
     // resume eve durable session:从 db 取上次 turn 持久化的 sessionId + continuationToken,
     // 喂给 client.session(state)。否则每次 client.session() 都新建会话,HITL 回答(inputResponses-only)
     // 无 continuationToken,createHandleMessageBody 命中 "continuationToken===undefined && message===undefined"
     // 返回 null,抛 "Session.send requires a non-empty message, inputResponses, or both"
     // (eve client/session.ts:345-355:inputResponses 必须配 continuationToken 才能构造 body)
-    const [sessRow] = await db.select({
-      eveSessionId: sessions.eveSessionId,
-      eveContinuationToken: sessions.eveContinuationToken,
-      streamIndex: sessions.streamIndex,
-    }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
     // streamIndex 从 db 读(替代硬编码 0):eve client #createEventStream 用 state.streamIndex 作 startIndex 续接(session.ts:166)
-    const sessionState = sessRow?.eveSessionId
+    const sessionState = sessRow.eveSessionId
       ? { sessionId: sessRow.eveSessionId, continuationToken: sessRow.eveContinuationToken ?? undefined, streamIndex: sessRow.streamIndex ?? 0 }
       : undefined;
     if (sessionState) {
@@ -177,14 +188,14 @@ export class EveagentBackend implements BackendAdapter {
     }
     const clientSession = client.session(sessionState);
     // eventCount 对齐 eve client currentStreamIndex(session.ts:182):从 db streamIndex 起始,每消费一个 eve event +1
-    let eventCount = sessRow?.streamIndex ?? 0;
+    const eventCountStart = sessRow.streamIndex ?? 0;
 
     const clientContext = history.length > 0
       ? JSON.stringify(history.map((m) => ({ role: m.role, content: m.content })))
       : undefined;
 
     // [eve] 记录请求：host + content 预览 + history 条数 + clientContext 长度 + inputResponses 条数
-    eveLog(`runTurn sid=${sessionId} host=${host} content=${JSON.stringify(content.slice(0, 50))} historyLen=${history.length} clientContextLen=${clientContext?.length ?? 0} inputResponsesLen=${inputResponses?.length ?? 0}`);
+    eveLog(`runTurn sid=${sessionId} host=${svc.host} content=${JSON.stringify(content.slice(0, 50))} historyLen=${history.length} clientContextLen=${clientContext?.length ?? 0} inputResponsesLen=${inputResponses?.length ?? 0}`);
 
     // eve client send 允许只有 inputResponses 无 message(HITL 回答);content 为空时传 undefined
     // (session.ts 校验:message 或 inputResponses 至少一个非空)
@@ -208,9 +219,34 @@ export class EveagentBackend implements BackendAdapter {
         .where(eq(sessions.id, sessionId));
     }
 
-    // Single-use MessageResponse: iterate to consume the NDJSON stream and
-    // advance the client cursor. The loop exits when the turn boundary event
-    // closes the stream, OR when the signal aborts.
+    // 消费 NDJSON 流 + 按结果分发(异常/abort/正常)。Single-use MessageResponse:iterate to consume
+    // the stream and advance the client cursor. Loop exits on turn boundary or signal abort.
+    const { eventCount: finalCount, aborted, error } = await this.consumeStream(sessionId, response, signal, eventCountStart);
+    if (error && error.name !== 'AbortError' && !aborted) {
+      // 非 abort 异常:emit+persist turn.completed(error) 解前端 isSending,再抛出(send.catch 吞)
+      await this.handleTurnError(sessionId, error, finalCount);
+      throw error;
+    }
+    if (aborted) {
+      // 主动停止:写 interrupted + emit turn.completed(interrupted) 让前端解开 isSending
+      await this.handleAbort(sessionId, finalCount);
+      return;
+    }
+    // 正常结束
+    await this.finalizeTurn(sessionId, finalCount);
+  }
+
+  // 消费 eve NDJSON 流:逐事件 mapEveEventToWebtoolEvent → emit + persist + streamIndex 推进。
+  // 返回 {eventCount, aborted, error}:runTurn 据此分发到异常/abort/正常收尾路径。
+  // try/catch 捕获流错误:abort 抛 AbortError(error 填充,aborted=true)、非 abort 异常(error 填充)。
+  private async consumeStream(
+    sessionId: string,
+    response: MessageResponse,
+    signal: AbortSignal,
+    eventCountStart: number,
+  ): Promise<{ eventCount: number; aborted: boolean; error: Error | null }> {
+    const db = await getDb();
+    let eventCount = eventCountStart;
     try {
       for await (const event of response) {
         if (signal.aborted) break;
@@ -242,51 +278,44 @@ export class EveagentBackend implements BackendAdapter {
       }
       // [eve] 流正常结束
       eveLog(`stream end sid=${sessionId} aborted=${signal.aborted} streamIndex=${eventCount}`);
-      // turn 正常结束(非 abort)写回最终 streamIndex + 清 pending;abort 路径在下方单独写
-      if (!signal.aborted) {
-        await db.update(sessions).set({
-          streamIndex: eventCount,
-          pendingUserMessage: null,
-          pendingUserMessageCreatedAt: null,
-        }).where(eq(sessions.id, sessionId));
-      }
+      return { eventCount, aborted: signal.aborted, error: null };
     } catch (err: any) {
       // [eve] 记录异常：名字 + 消息，判断是 abort 还是真错误
       eveLog(`error sid=${sessionId} name=${err?.name} msg=${err?.message} aborted=${signal.aborted}`);
-      // 非 abort 异常:emit+persist turn.completed(error) 解前端 isSending
-      // (原 throw 被 send.catch 吞(:128-132)不写 turn.completed,前端 use-session-messages.ts:199-203 依赖 turn.completed 解开 → 卡死)
-      if (err?.name !== 'AbortError' && !signal.aborted) {
-        const errorEvent = {
-          type: 'turn.completed' as const,
-          finishReason: 'error' as const,
-          error: { code: err?.name ?? 'unknown', message: err?.message ?? String(err) },
-        };
-        eventBus.emit(sessionId, errorEvent);
-        await persistSessionEvent(sessionId, errorEvent);
-        // 异常收尾写回最终 streamIndex + 清 pending
-        await db.update(sessions).set({
-          streamIndex: eventCount,
-          pendingUserMessage: null,
-          pendingUserMessageCreatedAt: null,
-        }).where(eq(sessions.id, sessionId));
-        eveLog(`turn error completed sid=${sessionId} streamIndex=${eventCount}`);
-        throw err;
-      }
+      return { eventCount, aborted: signal.aborted, error: err as Error };
     }
+  }
 
-    // 主动停止：写最后一条 assistant 消息的 finishReason='interrupted'，
-    // 并发 turn.completed（finishReason='interrupted'）让前端解开 isSending
-    if (signal.aborted) {
-      await this.markInterrupted(sessionId);
-      eventBus.emit(sessionId, { type: 'turn.completed', finishReason: 'interrupted' });
-      await persistSessionEvent(sessionId, { type: 'turn.completed', finishReason: 'interrupted' });
-      // abort 收尾写回最终 streamIndex + 清 pending
-      await db.update(sessions).set({
-        streamIndex: eventCount,
-        pendingUserMessage: null,
-        pendingUserMessageCreatedAt: null,
-      }).where(eq(sessions.id, sessionId));
-    }
+  // 非 abort 异常收尾:emit+persist turn.completed(error) 解前端 isSending + finalizeTurn
+  // (原 throw 被 send.catch 吞不写 turn.completed,前端 use-session-messages.ts 依赖 turn.completed 解开 → 卡死)
+  private async handleTurnError(sessionId: string, err: Error, eventCount: number): Promise<void> {
+    const errorEvent = {
+      type: 'turn.completed' as const,
+      finishReason: 'error' as const,
+      error: { code: err?.name ?? 'unknown', message: err?.message ?? String(err) },
+    };
+    eventBus.emit(sessionId, errorEvent);
+    await persistSessionEvent(sessionId, errorEvent);
+    await this.finalizeTurn(sessionId, eventCount);
+    eveLog(`turn error completed sid=${sessionId} streamIndex=${eventCount}`);
+  }
+
+  // 主动停止收尾:写最后一条 assistant interrupted + emit turn.completed(interrupted) + finalizeTurn
+  private async handleAbort(sessionId: string, eventCount: number): Promise<void> {
+    await this.markInterrupted(sessionId);
+    eventBus.emit(sessionId, { type: 'turn.completed', finishReason: 'interrupted' });
+    await persistSessionEvent(sessionId, { type: 'turn.completed', finishReason: 'interrupted' });
+    await this.finalizeTurn(sessionId, eventCount);
+  }
+
+  // turn 收尾(正常/异常/abort 三路径共用,去重):写回最终 streamIndex + 清 pending
+  private async finalizeTurn(sessionId: string, eventCount: number): Promise<void> {
+    const db = await getDb();
+    await db.update(sessions).set({
+      streamIndex: eventCount,
+      pendingUserMessage: null,
+      pendingUserMessageCreatedAt: null,
+    }).where(eq(sessions.id, sessionId));
   }
 
   // 把 session 当前最后一条 assistant 消息标记为 interrupted finishReason
@@ -350,12 +379,13 @@ export class EveagentBackend implements BackendAdapter {
   // 实际 resume 追回逻辑(由 resume 加锁后调用)
   private async doResume(sessionId: string, signal: AbortSignal): Promise<void> {
     const db = await getDb();
-    // 读 db session state(eveSessionId, continuationToken, streamIndex, pendingUserMessage)
+    // 读 db session state(eveSessionId, continuationToken, streamIndex, pendingUserMessage, targetId)
     const [sessRow] = await db.select({
       eveSessionId: sessions.eveSessionId,
       eveContinuationToken: sessions.eveContinuationToken,
       streamIndex: sessions.streamIndex,
       pendingUserMessage: sessions.pendingUserMessage,
+      targetId: sessions.targetId,
     }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
 
     // 无 eve session(尚未 send 过)→ 无法 resume
@@ -397,17 +427,14 @@ export class EveagentBackend implements BackendAdapter {
       return;
     }
 
-    // 取 host + client(对齐 runTurn getClient 缓存)
-    let host = this.sessionToHost.get(sessionId);
-    if (!host) {
-      host = await this.lookupHost(sessionId);
-      if (host) this.sessionToHost.set(sessionId, host);
-    }
-    if (!host) {
-      eveLog(`resume skip sid=${sessionId} reason=no-host`);
+    // 取 eve 服务(host + auth),按 serviceId 缓存带 auth 的 Client(对齐 runTurn)
+    const [svc] = await db.select({ host: eveServices.host, authType: eveServices.authType, authConfig: eveServices.authConfig })
+      .from(eveServices).where(eq(eveServices.id, sessRow.targetId)).limit(1);
+    if (!svc) {
+      eveLog(`resume skip sid=${sessionId} reason=no-service`);
       return;
     }
-    const client = this.getClient(host);
+    const client = this.getClient(sessRow.targetId, svc.host, svc.authType, svc.authConfig);
 
     const streamIndex = sessRow.streamIndex ?? 0;
     // sessionState 喂 client.session:eve client #streamAndAdvance 用 startIndex 覆盖 state.streamIndex 追回
@@ -467,14 +494,19 @@ export class EveagentBackend implements BackendAdapter {
     }
   }
 
-  private getClient(host: string): Client {
-    let client = this.clients.get(host);
-    if (!client) {
-      // 显式配置 maxReconnectAttempts:3——eve client #createEventStream(session.ts:157-221)已内置 stream 级断线重连
-      // (isStreamDisconnectError 识别断线错误,用 currentStreamIndex 续接 openStreamBody);webtool 不外包 for await 重连(死代码,见 LOG-003)
-      client = new Client({ host, maxReconnectAttempts: 3 });
-      this.clients.set(host, client);
+  // 按 serviceId 缓存带 auth 的 Client(一个 eve 服务一个 Client 实例,auth 跟着 service 走)。
+  // host 或 authKey(authType:authConfig)变更(PATCH 后)→ 下次调用重建 Client,自动生效新 auth,无需重启。
+  private getClient(serviceId: string, host: string, authType: string, authConfig: string | null): Client {
+    const authKey = `${authType}:${authConfig ?? ''}`;
+    const cached = this.clients.get(serviceId);
+    if (cached && cached.host === host && cached.authKey === authKey) {
+      return cached.client;  // 复用:host+auth 未变
     }
+    const authOpts = buildClientOptions(authType, authConfig);
+    // 显式配置 maxReconnectAttempts:3——eve client #createEventStream(session.ts:157-221)已内置 stream 级断线重连
+    // (isStreamDisconnectError 识别断线错误,用 currentStreamIndex 续接 openStreamBody);webtool 不外包 for await 重连(死代码,见 LOG-003)
+    const client = new Client({ host, maxReconnectAttempts: 3, ...authOpts });
+    this.clients.set(serviceId, { client, host, authKey });
     return client;
   }
 

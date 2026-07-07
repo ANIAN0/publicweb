@@ -12,6 +12,7 @@ import {
   Trash2,
   MoreHorizontal,
   MessageSquare,
+  Cloud,
 } from 'lucide-react';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -146,6 +147,12 @@ export default function Home() {
             className={buttonVariants({ variant: 'outline', size: 'sm' })}
           >
             <Settings className="size-4" /> 设备管理
+          </Link>
+          <Link
+            href="/eve-services"
+            className={buttonVariants({ variant: 'outline', size: 'sm' })}
+          >
+            <Cloud className="size-4" /> Eve 服务
           </Link>
         </div>
       </header>

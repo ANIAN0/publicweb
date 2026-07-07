@@ -58,8 +58,7 @@ export default function SessionPage() {
         p.type === 'dynamic-tool' &&
         p.state === 'approval-requested' &&
         Boolean(
-          (p as { toolMetadata?: { eve?: { inputRequest?: unknown } } }).toolMetadata?.eve
-            ?.inputRequest
+          (p as { toolMetadata?: { inputRequest?: unknown } }).toolMetadata?.inputRequest
         )
     );
   }, [messages]);

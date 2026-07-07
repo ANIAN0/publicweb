@@ -601,7 +601,7 @@ export class EveagentBackend implements BackendAdapter {
     }
 
     // input.requested:HITL 问题(eve ask_question 或带 approval 的工具)。每个 request → dynamic-tool part
-    // state=approval-requested,inputRequest 挂 toolMetadata.eve.inputRequest(前端按 display 渲染卡片)
+    // state=approval-requested,inputRequest 挂 toolMetadata.inputRequest(前端按 display 渲染卡片)
     // requestId(=action.callId)作 partId,与后续 action.result 的 callId 一致,part.update 能定位
     // 对齐 eve client message-reducer.ts:147-169 的投影
     if (t === 'input.requested' && Array.isArray(d.requests)) {
@@ -620,11 +620,9 @@ export class EveagentBackend implements BackendAdapter {
             // approval.id=requestId:对齐 eve client,使 ai-elements Confirmation 也可关联
             approval: { id: request.requestId },
             toolMetadata: {
-              eve: {
-                inputRequest: toMessageInputRequest(request),
-                kind: action.kind ?? 'tool-call',
-                name: action.toolName ?? 'ask_question',
-              },
+              inputRequest: toMessageInputRequest(request),
+              kind: action.kind ?? 'tool-call',
+              name: action.toolName ?? 'ask_question',
             },
           },
         });
@@ -750,7 +748,7 @@ export class EveagentBackend implements BackendAdapter {
           state: 'approval-requested',
           input: { description: d.description, name: d.name },
           approval: { id: partId },
-          toolMetadata: { eve: { kind: 'authorization', name: d.name } },
+          toolMetadata: { kind: 'authorization', name: d.name },
         },
       });
       st.startedParts.add(partId);

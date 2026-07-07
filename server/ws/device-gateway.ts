@@ -104,7 +104,7 @@ export function attachDeviceGateway(
       const threshold = new Date(Date.now() - AUTO_RESUME_MAX_AGE_MS);
       const resumable = await db.select().from(sessions)
         .where(and(
-          eq(sessions.deviceId, deviceId),
+          eq(sessions.targetId, deviceId),
           isNull(sessions.deletedAt),
           gt(sessions.lastActiveAt, threshold),
         ));
@@ -123,6 +123,8 @@ export function attachDeviceGateway(
             .filter((m) => m.role === 'user' || m.role === 'assistant')
             .map((m) => ({ role: m.role, content: extractTextFromParts(m.parts) }))
             .filter((m) => m.content),
+          // 透传 backendSessionRef 让 client 走 resume（从 sessions.localSessionRef 读）
+          backendSessionRef: sess.localSessionRef ?? undefined,
         };
         // 1) UI 横幅复位（SSE 通道）
         sessionEventBus.emit(sess.id, startEvent);
@@ -183,7 +185,7 @@ export function attachDeviceGateway(
       // 修复 REV-005-8。
       (async () => {
         const rows = await db.select({ id: sessions.id }).from(sessions)
-          .where(and(eq(sessions.deviceId, deviceId), isNull(sessions.deletedAt)));
+          .where(and(eq(sessions.targetId, deviceId), isNull(sessions.deletedAt)));
         for (const r of rows) {
           sessionEventBus.emit(r.id, {
             type: 'session.disconnected',
@@ -252,5 +254,10 @@ async function handleMessage(deviceId: string, message: any) {
     sessionEventBus.emit(message.sessionId, message.event);
   }
 
-  // 其他消息类型后续处理
+  // session.meta：client 上报 backend session 引用，落库 sessions.localSessionRef 做 resume
+  if (message.type === 'session.meta' && message.sessionId && message.backendSessionRef) {
+    db.update(sessions).set({ localSessionRef: message.backendSessionRef })
+      .where(eq(sessions.id, message.sessionId))
+      .catch(console.error);
+  }
 }

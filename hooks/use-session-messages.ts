@@ -341,7 +341,7 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
   const dismissDisconnected = useCallback(() => setDisconnected(false), []);
 
   // 回答 HITL ask_question / tool-approval:对齐 eve client 的 client.input.responded 投影
-  // 1) 本地乐观更新:把 requestId 对应的 dynamic-tool part 推到 approval-responded + 挂 toolMetadata.eve.inputResponse
+  // 1) 本地乐观更新:把 requestId 对应的 dynamic-tool part 推到 approval-responded + 挂 toolMetadata.inputResponse
   //    (用户立即看到"已回答";服务端 resume 后 action.result 会再把 state 推到 output-available,toolMetadata 浅合并保留 inputResponse)
   // 2) POST /input 让 adapter.send({ inputResponses }) 送达 eve(不设 sending:回答不锁输入框)
   const respondInput = useCallback(
@@ -352,21 +352,20 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
           if (m.role !== 'assistant') return m;
           let changed = false;
           const parts = m.parts.map((p) => {
-            const meta = (p as { toolMetadata?: { eve?: { inputRequest?: { requestId?: string } } } }).toolMetadata;
-            const req = meta?.eve?.inputRequest;
+            const meta = (p as { toolMetadata?: { inputRequest?: { requestId?: string } } }).toolMetadata;
+            const req = meta?.inputRequest;
             if (!req) return p;
             const resp = responses.find((r) => r.requestId === req.requestId);
             if (!resp) return p;
             changed = true;
-            // 浅合并 toolMetadata.eve,保留 inputRequest(只读展示)并挂 inputResponse(已回答)
-            const existingMeta = (p as { toolMetadata?: { eve?: Record<string, unknown> } }).toolMetadata ?? {};
-            const existingEve = existingMeta.eve ?? {};
+            // 浅合并 toolMetadata,保留 inputRequest(只读展示)并挂 inputResponse(已回答)
+            const existingMeta = (p as { toolMetadata?: Record<string, unknown> }).toolMetadata ?? {};
             return {
               ...p,
               state: 'approval-responded',
               toolMetadata: {
                 ...existingMeta,
-                eve: { ...existingEve, inputResponse: resp },
+                inputResponse: resp,
               },
             } as PersistedPart;
           });

@@ -62,12 +62,17 @@ export class LocalBackend implements BackendAdapter {
     if (!device) throw new Error(`device not found: ${opts.targetId}`);
     if (!device.online) throw new Error(`device offline: ${opts.targetId}`);
 
+    // 读 sessions.localSessionRef 透传给 client 走 resume（reload 续接）
+    const [sess] = await db.select({ localSessionRef: sessions.localSessionRef })
+      .from(sessions).where(eq(sessions.id, opts.sessionId)).limit(1);
+
     const ok = sendToDevice(opts.targetId, {
       type: 'session.start',
       sessionId: opts.sessionId,
       backend: this.id,           // 用 this.id 区分 claudecode/pi(不再靠 opts.backend hack)
       model: opts.model,
       history: opts.history,
+      backendSessionRef: sess?.localSessionRef ?? undefined,  // 透传 resume 引用
     });
     if (!ok) throw new Error(`device not connected: ${opts.targetId}`);
 
@@ -84,8 +89,8 @@ export class LocalBackend implements BackendAdapter {
   }
 
   // local(claudecode/pi)的 HITL 走 Claude Code 自有 AskUserQuestion 格式(questions 数组),
-  // 与 eve 的 inputResponses 不同路线;本次不实现,opts 忽略,签名对齐 BackendAdapter
-  async send(sessionId: string, content: string, _opts?: { inputResponses?: InputResponse[] }): Promise<void> {
+  // 与 eve 的 inputResponses 不同路线;opts.inputResponses 透传到 client 由 adapter 解释
+  async send(sessionId: string, content: string, opts?: { inputResponses?: InputResponse[] }): Promise<void> {
     // 优先用内存映射;缺失时回退查 sessions.targetId(webtool 重启/设备重连后内存映射空)
     let targetId = this.sessionToTarget.get(sessionId);
     if (!targetId) {
@@ -98,7 +103,8 @@ export class LocalBackend implements BackendAdapter {
       if (targetId) this.sessionToTarget.set(sessionId, targetId);
     }
     if (!targetId) throw new Error(`session ${sessionId} not bound to a target`);
-    const ok = sendToDevice(targetId, { type: 'session.send', sessionId, content });
+    // 透传 inputResponses（HITL 回答）到 client
+    const ok = sendToDevice(targetId, { type: 'session.send', sessionId, content, inputResponses: opts?.inputResponses });
     if (!ok) throw new Error(`device not connected: ${targetId}`);
   }
 

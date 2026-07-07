@@ -29,12 +29,13 @@ interface InputRequestActionsProps {
 }
 
 export function InputRequestActions({ part, onRespond, canRespond = true }: InputRequestActionsProps) {
-  // toolMetadata.eve.inputRequest/inputResponse:由 eveagent.ts input.requested 映射注入 + respondInput 乐观更新挂上
+  // toolMetadata.inputRequest/inputResponse：由 adapter（eve/claude/pi）注入 + respondInput 乐观更新挂上
+  // 统一路径（去 eve 专用）：三后端 HITL 共用
   const meta = (part as {
-    toolMetadata?: { eve?: { inputRequest?: InputRequest; inputResponse?: InputResponse } };
+    toolMetadata?: { inputRequest?: InputRequest; inputResponse?: InputResponse };
   }).toolMetadata;
-  const inputRequest = meta?.eve?.inputRequest;
-  const inputResponse = meta?.eve?.inputResponse;
+  const inputRequest = meta?.inputRequest;
+  const inputResponse = meta?.inputResponse;
   // 无 inputRequest(普通工具调用)不渲染
   if (!inputRequest) return null;
 

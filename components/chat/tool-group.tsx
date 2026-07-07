@@ -67,13 +67,13 @@ function hasToolDetails(part: PersistedPart): boolean {
     input?: unknown;
     output?: unknown;
     errorText?: string;
-    toolMetadata?: { eve?: { inputRequest?: unknown } };
+    toolMetadata?: { inputRequest?: unknown };
   };
   return Boolean(
     (p.input !== undefined && p.input !== null) ||
       p.output ||
       p.errorText ||
-      p.toolMetadata?.eve?.inputRequest
+      p.toolMetadata?.inputRequest
   );
 }
 
@@ -88,9 +88,10 @@ function ToolCallItem({
   // part 是 dynamic-tool PersistedPart;断言为 DynamicToolUIPart + _pid 访问标准字段
   const p = part as DynamicToolUIPart & { _pid?: string };
   // eve toolMetadata 非标准字段,单独断言(inputRequest/inputResponse 由 eveagent.ts + respondInput 注入)
-  const eveMeta = (part as { toolMetadata?: { eve?: { inputRequest?: unknown; inputResponse?: unknown } } }).toolMetadata?.eve;
-  const hasInputRequest = Boolean(eveMeta?.inputRequest);
-  const hasInputResponse = Boolean(eveMeta?.inputResponse);
+  // toolMetadata 统一路径（去 eve 专用）：inputRequest/inputResponse 由 adapter 注入
+  const meta = (part as { toolMetadata?: { inputRequest?: unknown; inputResponse?: unknown } }).toolMetadata;
+  const hasInputRequest = Boolean(meta?.inputRequest);
+  const hasInputResponse = Boolean(meta?.inputResponse);
   return (
     <Tool defaultOpen={hasInputRequest}>
       <ToolHeader type="dynamic-tool" state={p.state} toolName={p.toolName} />

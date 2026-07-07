@@ -10,6 +10,7 @@ import {
   Search,
   Pencil,
   Trash2,
+  Eraser,
   MoreHorizontal,
   MessageSquare,
   Cloud,
@@ -42,6 +43,8 @@ interface SessionItem {
   userTitle: string | null;
   targetId: string | null;
   targetName: string | null;
+  // 已删 target 标记:true 表示 target 已被删除（设备或 eve 服务被删后,sessions 表保留历史会话）
+  targetDeleted?: boolean;
   messageCount: number;
   lastActiveAt: string | number; // Date 经 JSON 序列化后变成 string
 }
@@ -334,7 +337,14 @@ function SessionRow({
               </div>
               {/* 元信息:设备 · 消息数 · 相对时间 */}
               <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                {item.targetName && <span>{item.targetName} · </span>}
+                {item.targetDeleted ? (
+                  // target 已删:显示灰色 Badge（按 backend 区分文案），保留历史会话可一键清理
+                  <Badge variant="secondary" className="mr-1.5 text-xs">
+                    {item.backend === 'eveagent' ? '已删除服务' : '已删除设备'}
+                  </Badge>
+                ) : item.targetName ? (
+                  <span>{item.targetName} · </span>
+                ) : null}
                 <span>
                   {item.messageCount} 条 · {formatRelative(new Date(item.lastActiveAt))}
                 </span>
@@ -356,6 +366,16 @@ function SessionRow({
                 <Pencil className="size-4" /> 重命名
               </DropdownMenuItem>
               <DropdownMenuSeparator />
+              {/* 清理项:仅 targetDeleted=true 显示,清理已删 target 的历史会话（区别于"删除"操作） */}
+              {item.targetDeleted && (
+                <DropdownMenuItem
+                  className="text-muted-foreground focus:bg-muted"
+                  onClick={() => setConfirmDelete(true)}
+                >
+                  <Eraser className="size-4" /> 清理
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
               {/* 删除项:红色文字 + hover 红底 */}
               <DropdownMenuItem
                 className="text-destructive focus:bg-destructive/10 focus:text-destructive"
@@ -368,13 +388,17 @@ function SessionRow({
         )}
       </div>
 
-      {/* 删除二次确认:用 shadcn Dialog 替代旧的 ConfirmDialog */}
+      {/* 删除/清理二次确认:用 shadcn Dialog。targetDeleted=true 时显示"清理"文案,否则"删除" */}
       <Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>删除会话?</DialogTitle>
+            <DialogTitle>
+              {item.targetDeleted ? '清理已删 target 的会话?' : '删除会话?'}
+            </DialogTitle>
             <DialogDescription>
-              确定要删除「{displayTitle}」吗?此操作不可恢复。
+              {item.targetDeleted
+                ? `「${displayTitle}」关联的 target 已被删除,此操作仅清理该会话记录,历史消息保留在数据库中。`
+                : `确定要删除「${displayTitle}」吗?此操作不可恢复。`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -390,7 +414,7 @@ function SessionRow({
               onClick={confirmDeleteAction}
               disabled={busy}
             >
-              删除
+              {item.targetDeleted ? '清理' : '删除'}
             </Button>
           </DialogFooter>
         </DialogContent>

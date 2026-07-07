@@ -122,6 +122,8 @@ export async function GET(request: NextRequest) {
     userTitle: s.userTitle,
     targetId: s.targetId,
     targetName: targetNameById.get(s.targetId) ?? null,
+    // 已删 target 标记:true 表示 target 已被删除(用于前端展示"已删除设备/服务" + 提供清理按钮)
+    targetDeleted: !targetNameById.has(s.targetId),
     messageCount: countBySessionId.get(s.id) ?? 0,
     createdAt: s.createdAt,
     lastActiveAt: s.lastActiveAt,

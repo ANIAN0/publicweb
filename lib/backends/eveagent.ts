@@ -502,6 +502,14 @@ export class EveagentBackend implements BackendAdapter {
     if (cached && cached.host === host && cached.authKey === authKey) {
       return cached.client;  // 复用:host+auth 未变
     }
+    // 重建原因:cache miss / host 变更 / authKey 变更(PATCH auth 后下次调用命中此分支)
+    // 用 eveLog 写入 workplace/logs/eve-YYYYMMDD.log,便于 V-011 验收阶段 grep 验证
+    const reason = !cached
+      ? 'cache miss'
+      : cached.host !== host
+        ? 'host changed'
+        : 'authKey changed';
+    eveLog(`[eveagent] client rebuild serviceId=${serviceId} reason=${reason}`);
     const authOpts = buildClientOptions(authType, authConfig);
     // 显式配置 maxReconnectAttempts:3——eve client #createEventStream(session.ts:157-221)已内置 stream 级断线重连
     // (isStreamDisconnectError 识别断线错误,用 currentStreamIndex 续接 openStreamBody);webtool 不外包 for await 重连(死代码,见 LOG-003)

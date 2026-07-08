@@ -86,3 +86,10 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Streamdown 外链安全弹窗:库内硬编码 max-w-md(448px)过宽,收窄到 max-w-sm(384px)
+   弹窗 class 写死在 streamdown 库无法用 className 覆盖,改用属性选择器裸 CSS
+   (裸 CSS 不在 @layer 内,优先级高于 Tailwind @layer utilities 的 max-w-md) */
+[data-streamdown="link-safety-modal"] > div {
+  max-width: 24rem;
+}

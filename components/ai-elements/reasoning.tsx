@@ -187,7 +187,7 @@ export const ReasoningTrigger = memo(
             {getThinkingMessage(isStreaming, duration)}
             <ChevronDownIcon
               className={cn(
-                "size-4 transition-transform",
+                "ml-auto size-4 transition-transform",
                 isOpen ? "rotate-180" : "rotate-0"
               )}
             />

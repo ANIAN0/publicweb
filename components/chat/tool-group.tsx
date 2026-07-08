@@ -144,7 +144,7 @@ export function ToolGroup({
         )}
       </button>
       {open && canExpand && (
-        <div className="mt-2 space-y-2 pl-3">
+        <div className="mt-2 space-y-2">
           {parts.map((p, i) => (
             <ToolCallItem key={(p as { _pid?: string })._pid ?? i} part={p} onRespond={onRespond} />
           ))}

@@ -26,7 +26,7 @@ export interface BackendAdapter extends BackendDescriptor {
   /** 列出该后端可用的执行端点(自带 models);前端按 models 数量决定是否显示模型步 */
   listTargets(): Promise<ExecutionTarget[]>;
   /** 创建或续接一个 session;targetId 对 local 是 device.id,对 eveagent 是 eve_service.id */
-  startSession(opts: { sessionId: string; model: string; targetId: string; history: ChatMessage[] }): Promise<void>;
+  startSession(opts: { sessionId: string; model: string; targetId: string; history: ChatMessage[]; cwd?: string }): Promise<void>;
   /** 发送一条用户消息（不等待响应）；opts.inputResponses 用于回答 HITL ask_question（eve 路线） */
   send(sessionId: string, content: string, opts?: { inputResponses?: InputResponse[] }): Promise<void>;
   /** 主动停止当前 turn（不 kill agent 进程） */

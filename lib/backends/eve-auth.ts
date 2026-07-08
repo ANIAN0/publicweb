@@ -1,8 +1,25 @@
-// eve 服务 auth 配置的 API 层工具:校验(POST/PATCH 输入)+ 脱敏(GET 输出)
+// eve 服务 auth 配置的 API 层工具:校验(POST/PATCH 输入)+ 解析(eveagent/编辑回显共用)
 // auth 形态与 eveagent.ts buildClientOptions 对齐:none / bearer / headers
-// token 明文存 db(schema.ts auth_config 列),GET 不回显明文(bearer→hasToken / headers→headerNames)
+// token 明文存 db(schema.ts auth_config 列);本地应用,GET 原样返回明文供编辑回显
 
 export type AuthType = 'none' | 'bearer' | 'headers';
+
+// 解析 authConfig(JSON 字符串或对象)→ 结构化形态(token/headers);空/损坏 → null
+// validateAuth/eveagent.buildClientOptions/编辑回显共用,消除 JSON.parse + authType 分支重复
+// 空字符串 token 归 undefined(统一"空 token 视为无效"语义)
+export function parseAuthConfig(authConfig: string | object | null | undefined): { token?: string; headers?: Record<string, string> } | null {
+  if (authConfig === null || authConfig === undefined) return null;
+  let cfg: any;
+  if (typeof authConfig === 'string') {
+    try { cfg = JSON.parse(authConfig); } catch { return null; }
+  } else {
+    cfg = authConfig;
+  }
+  return {
+    token: typeof cfg?.token === 'string' && cfg.token.length > 0 ? cfg.token : undefined,
+    headers: cfg?.headers && typeof cfg.headers === 'object' ? cfg.headers as Record<string, string> : undefined,
+  };
+}
 
 // 校验并规范化 authType + authConfig。
 // - none:authConfig 忽略,置 null
@@ -20,38 +37,16 @@ export function validateAuth(
   if (authConfig === undefined || authConfig === null) {
     return { ok: false, error: `${t} authConfig 必填` };
   }
-  // 解析 authConfig(接受 JSON 字符串或对象)
-  let cfg: any;
-  if (typeof authConfig === 'string') {
-    try { cfg = JSON.parse(authConfig); } catch { return { ok: false, error: 'authConfig 不是合法 JSON' }; }
-  } else {
-    cfg = authConfig;
-  }
+  const parsed = parseAuthConfig(authConfig);
   if (t === 'bearer') {
-    if (typeof cfg?.token !== 'string' || cfg.token.length === 0) {
+    if (!parsed?.token) {
       return { ok: false, error: 'bearer authConfig 需为 {token: string}' };
     }
-    return { ok: true, authType: 'bearer', authConfig: JSON.stringify({ token: cfg.token }) };
+    return { ok: true, authType: 'bearer', authConfig: JSON.stringify({ token: parsed.token }) };
   }
   // headers
-  if (!cfg?.headers || typeof cfg.headers !== 'object') {
+  if (!parsed?.headers) {
     return { ok: false, error: 'headers authConfig 需为 {headers: Record<string,string>}' };
   }
-  return { ok: true, authType: 'headers', authConfig: JSON.stringify({ headers: cfg.headers }) };
-}
-
-// GET 脱敏:bearer 不回显 token(→ hasToken),headers 不回显 value(→ headerNames),none/损坏 → null
-// 前端据此显示"已配置 token"/"已配置 N 个自定义头",编辑时若不改 auth 则 PATCH 不传 authType
-export function maskAuth(authType: string | null, authConfig: string | null): { authType: string; authConfig: string | null } {
-  if (!authConfig) return { authType: authType ?? 'none', authConfig: null };
-  let cfg: any;
-  try { cfg = JSON.parse(authConfig); } catch { return { authType: authType ?? 'none', authConfig: null }; }
-  if (authType === 'bearer') {
-    return { authType, authConfig: JSON.stringify({ hasToken: Boolean(cfg?.token) }) };
-  }
-  if (authType === 'headers') {
-    const headerNames = cfg?.headers && typeof cfg.headers === 'object' ? Object.keys(cfg.headers) : [];
-    return { authType, authConfig: JSON.stringify({ headerNames }) };
-  }
-  return { authType: authType ?? 'none', authConfig: null };
+  return { ok: true, authType: 'headers', authConfig: JSON.stringify({ headers: parsed.headers }) };
 }

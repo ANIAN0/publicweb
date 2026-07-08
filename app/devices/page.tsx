@@ -7,14 +7,7 @@ import { Button, buttonVariants } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
 import { Spinner } from '@/components/ui/spinner';
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogFooter,
-  DialogTitle,
-  DialogDescription,
-} from '@/components/ui/dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -22,8 +15,11 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
-import { RefreshCw, Plus, MoreHorizontal, Trash2, ChevronDown, ChevronUp, Cpu, CheckCircle2, XCircle } from 'lucide-react';
+import { ArrowLeft, RefreshCw, Plus, MoreHorizontal, Trash2, ChevronDown, ChevronUp, Cpu, CheckCircle2, XCircle } from 'lucide-react';
+import Link from 'next/link';
 import AddDeviceDialog from './_components/AddDeviceDialog';
+import { formatRelative } from '@/lib/utils';
+import { backendLabel } from '@/lib/backends/labels';
 
 interface DeviceModel { id: string; label: string; isDefault?: boolean }
 interface DeviceModels { backend: string; models: DeviceModel[]; refreshedAt: string | null }
@@ -36,18 +32,7 @@ interface Device {
   supportedBackends: string[];
 }
 
-// 相对时间格式化
-function formatRelative(dateStr: string | null): string {
-  if (!dateStr) return '从未';
-  const d = new Date(dateStr);
-  const diff = Date.now() - d.getTime();
-  const min = Math.floor(diff / 60000);
-  if (min < 1) return '刚刚';
-  if (min < 60) return `${min} 分钟前`;
-  const hour = Math.floor(min / 60);
-  if (hour < 24) return `${hour} 小时前`;
-  return d.toLocaleDateString('zh-CN');
-}
+// formatRelative 抽到 lib/utils(与首页共用,行为一致)
 
 export default function DevicesPage() {
   const [devices, setDevices] = useState<Device[]>([]);
@@ -141,8 +126,11 @@ export default function DevicesPage() {
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       {/* 顶部：标题 + 操作按钮 */}
-      <header className="flex items-center justify-between px-6 py-4">
+      <header className="sticky top-0 z-10 flex items-center justify-between border-b bg-background px-6 py-4">
         <div className="flex items-center gap-2">
+          <Link href="/" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}>
+            <ArrowLeft className="size-4" />
+          </Link>
           <Cpu className="size-5" />
           <span className="text-lg font-semibold">设备管理</span>
         </div>
@@ -166,7 +154,7 @@ export default function DevicesPage() {
       )}
 
       {/* 列表 / 加载态 / 空状态 */}
-      <main className="flex-1 overflow-y-auto px-6 pb-8">
+      <main className="min-h-0 flex-1 overflow-y-auto px-6 pt-4 pb-8">
         {loading ? (
           <div className="py-12 text-center text-sm text-muted-foreground">
             <Spinner className="mx-auto size-6 mb-2" />
@@ -205,7 +193,7 @@ export default function DevicesPage() {
                     <div className="mt-1 flex flex-wrap gap-1">
                       {device.supportedBackends.map((b) => (
                         <Badge key={b} variant="outline" className="text-xs">
-                          {b === 'claudecode' ? 'Claude Code' : b === 'pi' ? 'Pi' : b}
+                          {backendLabel(b)}
                         </Badge>
                       ))}
                     </div>
@@ -239,7 +227,7 @@ export default function DevicesPage() {
                       deviceModels[device.id].map((row) => (
                         <div key={row.backend} className="text-xs">
                           <div className="font-medium text-muted-foreground mb-1">
-                            {row.backend === 'claudecode' ? 'Claude Code' : row.backend === 'pi' ? 'Pi' : row.backend}
+                            {backendLabel(row.backend)}
                           </div>
                           <div className="flex flex-wrap gap-1">
                             {row.models.length > 0 ? row.models.map((m) => (
@@ -273,25 +261,15 @@ export default function DevicesPage() {
       )}
 
       {/* 删除二次确认 */}
-      <Dialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>删除设备?</DialogTitle>
-            <DialogDescription>
-              确定要删除「{deleteTarget?.name}」吗？此操作不可恢复，设备需要重新注册。
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={deleting}>
-              取消
-            </Button>
-            <Button variant="destructive" onClick={confirmDelete} disabled={deleting}>
-              {deleting && <Spinner className="size-4" />}
-              删除
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConfirmDialog
+        open={!!deleteTarget}
+        onOpenChange={(open) => !open && setDeleteTarget(null)}
+        title="删除设备?"
+        description={<>确定要删除「{deleteTarget?.name}」吗？此操作不可恢复，设备需要重新注册。</>}
+        confirmText="删除"
+        busy={deleting}
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 }

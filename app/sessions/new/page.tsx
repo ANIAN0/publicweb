@@ -2,7 +2,9 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Spinner } from '@/components/ui/spinner';
 import { cn } from '@/lib/utils';
@@ -42,6 +44,7 @@ export default function NewSession() {
   const [targets, setTargets] = useState<ExecutionTarget[]>([]);
   const [targetId, setTargetId] = useState<string>('');
   const [model, setModel] = useState<string>('');
+  const [cwd, setCwd] = useState<string>('');  // 工作目录(local 可选,留空用 client 运行目录)
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string>('');
 
@@ -93,7 +96,7 @@ export default function NewSession() {
       const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ backend, targetId, model }),
+        body: JSON.stringify({ backend, targetId, model, cwd: cwd || undefined }),
       });
       if (res.ok) {
         const data = await res.json();
@@ -118,6 +121,10 @@ export default function NewSession() {
   return (
     <div className="flex min-h-screen flex-col items-center px-4 py-12">
       <div className="w-full max-w-2xl">
+        {/* 返回首页 */}
+        <Link href="/" className="mb-4 inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+          <ArrowLeft className="size-4" /> 返回首页
+        </Link>
         {/* 标题区 */}
         <div className="mb-8">
           <h1 className="text-2xl font-bold">新建会话</h1>
@@ -224,6 +231,18 @@ export default function NewSession() {
                     </button>
                   );
                 })}
+              </div>
+            )}
+            {/* local 端点可选工作目录:claudecode/pi 子进程的 cwd;留空用 client 运行目录 */}
+            {selectedTarget && (backend === 'claudecode' || backend === 'pi') && (
+              <div className="mt-3">
+                <label className="text-xs text-muted-foreground">工作目录(可选)</label>
+                <Input
+                  value={cwd}
+                  onChange={(e) => setCwd(e.target.value)}
+                  placeholder="留空用 client 运行目录"
+                  className="mt-1"
+                />
               </div>
             )}
             <div className="mt-4 flex items-center justify-between">

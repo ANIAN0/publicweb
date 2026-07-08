@@ -3,18 +3,13 @@ import { getDb } from '@/lib/db/client';
 import { eveServices } from '@/lib/db/schema';
 import { ulid } from 'ulid';
 import { desc } from 'drizzle-orm';
-import { validateAuth, maskAuth } from '@/lib/backends/eve-auth';
+import { validateAuth } from '@/lib/backends/eve-auth';
 
-// GET /api/eve-services —— 列出所有 eve 服务端点(token 脱敏:不回显 bearer token / headers value)
+// GET /api/eve-services —— 列出所有 eve 服务端点(本地应用:authConfig 原样返回明文,供编辑回显)
 export async function GET() {
   const db = await getDb();
   const rows = await db.select().from(eveServices).orderBy(desc(eveServices.createdAt));
-  // 脱敏 authConfig:前端列表只看到 hasToken/headerNames,拿不到明文凭证
-  const masked = rows.map((r) => {
-    const m = maskAuth(r.authType, r.authConfig);
-    return { ...r, authType: m.authType, authConfig: m.authConfig };
-  });
-  return NextResponse.json(masked);
+  return NextResponse.json(rows);
 }
 
 // POST /api/eve-services —— 添加 eve 服务(name + host + model + 可选 authType/authConfig)

@@ -18,8 +18,10 @@ import {
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
-import { Cloud, Plus, MoreHorizontal, Trash2, Pencil, RefreshCw, CheckCircle2, XCircle, ArrowLeft } from 'lucide-react';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { Cloud, Plus, MoreHorizontal, Trash2, Pencil, RefreshCw, CheckCircle2, XCircle, ArrowLeft, Eye, EyeOff } from 'lucide-react';
 import Link from 'next/link';
+import { parseAuthConfig } from '@/lib/backends/eve-auth';
 
 interface EveService {
   id: string;
@@ -27,7 +29,7 @@ interface EveService {
   host: string;
   model: string;
   authType: string; // none/bearer/headers
-  authConfig: string | null; // 脱敏：bearer→{hasToken}，headers→{headerNames}
+  authConfig: string | null; // 明文 JSON:bearer→{token} / headers→{headers}
   online: boolean | null;
   createdAt: string;
 }
@@ -43,9 +45,8 @@ export default function EveServicesPage() {
   const [services, setServices] = useState<EveService[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // 添加/编辑对话框
-  const [editing, setEditing] = useState<EveService | null>(null);
-  const [showAdd, setShowAdd] = useState(false);
+  // 添加/编辑对话框:null=关闭; 'add'=添加模式; EveService=编辑该服务(互斥,合并原 showAdd+editing)
+  const [dialogTarget, setDialogTarget] = useState<EveService | 'add' | null>(null);
   // 删除确认
   const [deleteTarget, setDeleteTarget] = useState<EveService | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -65,10 +66,8 @@ export default function EveServicesPage() {
     }
   }, []);
 
-  useEffect(() => { fetchServices(); }, [fetchServices]);
-
-  // 探活：GET /api/backends/eveagent/targets 返回 online
-  const probeServices = async () => {
+  // 探活:GET /api/backends/eveagent/targets 返回 online,合并到 services(useCallback 便于 effect 依赖)
+  const probeServices = useCallback(async () => {
     try {
       const res = await fetch('/api/backends/eveagent/targets');
       if (res.ok) {
@@ -80,7 +79,10 @@ export default function EveServicesPage() {
         }));
       }
     } catch { /* 探活失败不阻塞 */ }
-  };
+  }, []);
+
+  // 初次加载:先拉列表再探活,确保进页面就能看到在线徽章
+  useEffect(() => { fetchServices().then(() => probeServices()); }, [fetchServices, probeServices]);
 
   const confirmDelete = async () => {
     if (!deleteTarget) return;
@@ -95,7 +97,7 @@ export default function EveServicesPage() {
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
-      <header className="flex items-center justify-between px-6 py-4">
+      <header className="sticky top-0 z-10 flex items-center justify-between border-b bg-background px-6 py-4">
         <div className="flex items-center gap-2">
           <Link href="/" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}>
             <ArrowLeft className="size-4" />
@@ -108,20 +110,20 @@ export default function EveServicesPage() {
             {loading ? <Spinner className="size-4" /> : <RefreshCw className="size-4" />}
             刷新
           </Button>
-          <Button size="sm" onClick={() => setShowAdd(true)}>
+          <Button size="sm" onClick={() => setDialogTarget('add')}>
             <Plus className="size-4" /> 添加服务
           </Button>
         </div>
       </header>
 
       {error && (
-        <div className="mx-6 mb-4 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive flex items-center justify-between">
+        <div className="mx-6 mt-4 mb-4 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive flex items-center justify-between">
           <span>{error}</span>
           <Button variant="ghost" size="sm" onClick={fetchServices}>重试</Button>
         </div>
       )}
 
-      <main className="flex-1 overflow-y-auto px-6 pb-8">
+      <main className="min-h-0 flex-1 overflow-y-auto px-6 pt-4 pb-8">
         {loading ? (
           <div className="py-12 text-center text-sm text-muted-foreground">
             <Spinner className="mx-auto size-6 mb-2" />加载中...
@@ -130,7 +132,7 @@ export default function EveServicesPage() {
           <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
             <Cloud className="size-8 text-muted-foreground/40" />
             <p className="text-sm text-muted-foreground">暂无 eve 服务</p>
-            <Button variant="outline" size="sm" onClick={() => setShowAdd(true)}>
+            <Button variant="outline" size="sm" onClick={() => setDialogTarget('add')}>
               <Plus className="size-4" /> 添加第一个服务
             </Button>
           </div>
@@ -163,7 +165,7 @@ export default function EveServicesPage() {
                       <MoreHorizontal className="size-4" />
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={() => setEditing(svc)}>
+                      <DropdownMenuItem onClick={() => setDialogTarget(svc)}>
                         <Pencil className="size-4" /> 编辑
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
@@ -183,29 +185,28 @@ export default function EveServicesPage() {
       </main>
 
       {/* 添加/编辑对话框 */}
-      {(showAdd || editing) && (
+      {dialogTarget !== null && (
         <EveServiceDialog
-          service={editing}
-          onClose={() => { setShowAdd(false); setEditing(null); }}
-          onSaved={() => { setShowAdd(false); setEditing(null); fetchServices(); }}
+          service={dialogTarget === 'add' ? null : dialogTarget}
+          onClose={() => setDialogTarget(null)}
+          onSaved={() => {
+            setDialogTarget(null);
+            // 先拉列表再探活,确保新增/编辑的服务也被探到 online
+            fetchServices().then(() => probeServices());
+          }}
         />
       )}
 
       {/* 删除确认 */}
-      <Dialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>删除 eve 服务?</DialogTitle>
-            <DialogDescription>确定要删除「{deleteTarget?.name}」吗？关联会话仍保留历史。</DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={deleting}>取消</Button>
-            <Button variant="destructive" onClick={confirmDelete} disabled={deleting}>
-              {deleting && <Spinner className="size-4" />}删除
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConfirmDialog
+        open={!!deleteTarget}
+        onOpenChange={(open) => !open && setDeleteTarget(null)}
+        title="删除 eve 服务?"
+        description={<>确定要删除「{deleteTarget?.name}」吗？关联会话仍保留历史。</>}
+        confirmText="删除"
+        busy={deleting}
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 }
@@ -218,8 +219,14 @@ function EveServiceDialog({ service, onClose, onSaved }: { service: EveService |
   const [authType, setAuthType] = useState<'none' | 'bearer' | 'headers'>(
     (service?.authType as 'none' | 'bearer' | 'headers') ?? 'none'
   );
-  const [bearerToken, setBearerToken] = useState('');
-  const [headerKeys, setHeaderKeys] = useState('');
+  // 编辑时回显明文:从 service.authConfig 解析 token/headers(本地应用 GET 返回明文)
+  const initialAuth = service ? parseAuthConfig(service.authConfig) : null;
+  const [bearerToken, setBearerToken] = useState(initialAuth?.token ?? '');
+  // headers 回显为 key: value 每行一组
+  const [headerKeys, setHeaderKeys] = useState(
+    initialAuth?.headers ? Object.entries(initialAuth.headers).map(([k, v]) => `${k}: ${v}`).join('\n') : '',
+  );
+  const [showToken, setShowToken] = useState(false);  // bearer token 显示/隐藏切换(默认隐藏防肩窥,编辑回显时点眼睛临时看明文)
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -292,7 +299,13 @@ function EveServiceDialog({ service, onClose, onSaved }: { service: EveService |
               </SelectContent>
             </Select>
             {authType === 'bearer' && (
-              <Input value={bearerToken} onChange={(e) => setBearerToken(e.target.value)} placeholder="Bearer Token" type="password" />
+              <div className="relative">
+                {/* type 切换:默认 password 防肩窥,点眼睛临时显示明文以确认回显值 */}
+                <Input value={bearerToken} onChange={(e) => setBearerToken(e.target.value)} placeholder="token（无需 Bearer 前缀，SDK 自动加 Bearer）" type={showToken ? 'text' : 'password'} className="pr-9" />
+                <button type="button" onClick={() => setShowToken((v) => !v)} tabIndex={-1} aria-label={showToken ? '隐藏 token' : '显示 token'} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                  {showToken ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                </button>
+              </div>
             )}
             {authType === 'headers' && (
               <textarea
@@ -303,7 +316,7 @@ function EveServiceDialog({ service, onClose, onSaved }: { service: EveService |
               />
             )}
             {service && authType !== 'none' && (
-              <p className="text-xs text-muted-foreground">编辑时不填 token/headers 则保留原值</p>
+              <p className="text-xs text-muted-foreground">编辑时 token/headers 已回显明文,可直接修改;清空并保存会报错(清除凭证请改选"无认证")</p>
             )}
           </div>
         </div>

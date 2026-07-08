@@ -2,6 +2,9 @@
 
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useParams } from 'next/navigation';
+import Link from 'next/link';
+import { ArrowLeft } from 'lucide-react';
+import { buttonVariants } from '@/components/ui/button';
 import { useSessionMessages } from '@/hooks/use-session-messages';
 import { MessageParts } from '@/components/chat/message-parts';
 import { ThinkingMessage } from '@/components/chat/thinking-message';
@@ -124,6 +127,13 @@ export default function SessionPage() {
 
   return (
     <div className="flex h-screen flex-col">
+      {/* 顶部导航:返回首页(会话列表),对齐 eve-services 页 ArrowLeft */}
+      <header className="flex items-center gap-2 border-b bg-background px-4 py-3">
+        <Link href="/" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}>
+          <ArrowLeft className="size-4" />
+        </Link>
+        <span className="text-sm font-medium">对话</span>
+      </header>
       {/* 中断横幅:device 离线 / session.disconnected 时显示 */}
       <InterruptBanner
         open={disconnected}

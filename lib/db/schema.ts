@@ -46,7 +46,7 @@ export const eveServices = sqliteTable('eve_services', {
   //   bearer → { token: string }
   //   headers → { headers: Record<string,string> }
   //   none   → null
-  // GET /api/eve-services 返回时 token 脱敏(不回显明文),PATCH 单独更新
+  // GET /api/eve-services 原样返回明文(本地应用,供编辑回显);POST/PATCH 用 validateAuth 校验写入
   authConfig: text('auth_config'),
   online: integer('online', { mode: 'boolean' }).default(false),
   lastSeenAt: integer('last_seen_at', { mode: 'timestamp' }),
@@ -60,6 +60,8 @@ export const sessions = sqliteTable('sessions', {
   // 去外键因 target 多态;每个 session 都必须绑定一个 target。
   targetId: text('target_id').notNull(),
   model: text('model').notNull(),
+  // 工作目录:local(claudecode/pi)子进程的 cwd;null 表示用 client 运行目录(默认)。eveagent 忽略
+  cwd: text('cwd'),
   title: text('title'),                                        // 自动标题（首条用户消息前 30 字）
   userTitle: text('user_title'),                                // 用户自定义，覆盖 title
   eveSessionId: text('eve_session_id'),                        // eveagent 专用

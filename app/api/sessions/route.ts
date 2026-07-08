@@ -7,7 +7,7 @@ import { getBackendAdapter } from '@/lib/backends/router';
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
-  const { backend, model, targetId } = body;
+  const { backend, model, targetId, cwd } = body;
 
   if (!backend || !model || !targetId) {
     return NextResponse.json({ error: 'backend, model, targetId are required' }, { status: 400 });
@@ -36,23 +36,26 @@ export async function POST(request: NextRequest) {
   const now = new Date();
   const db = await getDb();
 
-  // 创建 session 记录(targetId 多态:local=device.id, eveagent=eve_service.id)
-  await db.insert(sessions).values({
-    id,
-    backend,
-    model,
-    targetId,
-    createdAt: now,
-    lastActiveAt: now,
-  });
-
-  // 启动 session:适配器内部决定对接方式(local 派发 WS 到 client,eveagent 选 host 走 HTTP)
-  adapter.startSession({
-    sessionId: id,
-    model,
-    targetId,
-    history: [],
-  }).catch(console.error);
+  // 创建 session 记录 + 启动:任一失败回滚 + 500 + 打日志定位根因(AGENTS.md 第 13 条)
+  // insert 失败常见于 schema 变更后未跑 migration(如 cwd 列缺失);startSession 失败常见于设备 WS 断连
+  try {
+    await db.insert(sessions).values({
+      id,
+      backend,
+      model,
+      targetId,
+      cwd: cwd ?? null,  // 工作目录:local 子进程 cwd;null 表示用 client 运行目录
+      createdAt: now,
+      lastActiveAt: now,
+    });
+    // 启动 session:适配器内部决定对接方式(local 派发 WS 到 client,eveagent 选 host 走 HTTP)
+    await adapter.startSession({ sessionId: id, model, targetId, history: [], cwd });
+  } catch (err) {
+    console.error(`[session-create] failed backend=${backend} targetId=${targetId}:`, err);
+    await db.delete(sessions).where(eq(sessions.id, id)).catch(() => {});
+    const message = err instanceof Error ? err.message : 'create session failed';
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
 
   return NextResponse.json({ id, backend, model, targetId, lastActiveAt: now }, { status: 201 });
 }

@@ -14,7 +14,13 @@ interface DeviceConnection {
   lastPong: number;
 }
 
-const connections = new Map<string, DeviceConnection>();
+// globalThis 持有:custom server(tsx server.ts)与 Next.js route handler(turbopack 编译)是两套模块加载器,
+// 模块级 const 会各建一份 Map 不共享 -- bridge 连 server.ts 侧 set,route 侧 get 拿空 -> "device not connected"。
+// 用 globalThis 保证同进程共享(同 client.ts __dbConn 模式)。
+declare global {
+  var __deviceConnections: Map<string, DeviceConnection> | undefined;
+}
+const connections = globalThis.__deviceConnections ?? (globalThis.__deviceConnections = new Map());
 
 // 自动续接阈值：device 重连后，只为 lastActiveAt 距今不到此值的 session 推 session.start
 const AUTO_RESUME_MAX_AGE_MS = 30 * 60 * 1000;
@@ -25,7 +31,11 @@ const AUTO_RESUME_MAX_AGE_MS = 30 * 60 * 1000;
  */
 export function sendToDevice(deviceId: string, message: unknown): boolean {
   const conn = connections.get(deviceId);
-  if (!conn || conn.ws.readyState !== WebSocket.OPEN) return false;
+  if (!conn || conn.ws.readyState !== WebSocket.OPEN) {
+    // 诊断:未命中时打印 connections 规模(确认 globalThis 共享是否生效;双实例时 size=0)
+    console.log(`[sendToDevice] MISS target=${deviceId} found=${!!conn} readyState=${conn?.ws.readyState} size=${connections.size} keys=[${[...connections.keys()].join(',')}]`);
+    return false;
+  }
   conn.ws.send(JSON.stringify(message));
   return true;
 }
@@ -35,6 +45,14 @@ export function attachDeviceGateway(
   // Next.js 的 WS upgrade 处理器:转交非设备 WS(如 dev 模式 HMR 的 /_next/webpack-hmr),避免被 destroy 导致连接失败
   nextUpgrade?: (req: import('http').IncomingMessage, socket: import('net').Socket, head: Buffer) => void,
 ) {
+  // dev server 重启后内存 connections 清空,但 DB devices.online 仍是旧值(上次 bridge 连接设的 true),
+  // 导致"设备在线"假象——route.ts 的 online 校验放行,到 local.ts 才报 "device not connected"。
+  // 启动时统一置 false,bridge 重连后 connection 回调(line 92)重新 set true。
+  (async () => {
+    const db = await getDb();
+    await db.update(devices).set({ online: false }).catch(console.error);
+  })();
+
   const wss = new WebSocketServer({ noServer: true });
 
   // upgrade 回调改为 async：先 await 拿到 db 再做 token 校验 + 查询设备
@@ -62,6 +80,7 @@ export function attachDeviceGateway(
         .where(eq(devices.longLivedTokenHash, tokenHash))
         .limit(1);
       if (!device) {
+        console.warn('[device-gateway] WS upgrade rejected: token 不匹配(无对应 device)');
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
         return;
@@ -78,6 +97,7 @@ export function attachDeviceGateway(
 
   // 连接回调改为 async：在 setup 阶段 await getDb()，后续 setInterval/close 回调闭包引用 db
   wss.on('connection', async (ws: WebSocket, _req: unknown, deviceId: string) => {
+    console.log(`[device-gateway] device connected: ${deviceId}`);
     const connection: DeviceConnection = {
       ws,
       deviceId,
@@ -125,6 +145,8 @@ export function attachDeviceGateway(
             .filter((m) => m.content),
           // 透传 backendSessionRef 让 client 走 resume（从 sessions.localSessionRef 读）
           backendSessionRef: sess.localSessionRef ?? undefined,
+          // 透传工作目录(auto-resume 也要在原 cwd 续跑)
+          cwd: sess.cwd ?? undefined,
         };
         // 1) UI 横幅复位（SSE 通道）
         sessionEventBus.emit(sess.id, startEvent);
@@ -173,6 +195,7 @@ export function attachDeviceGateway(
     });
 
     ws.on('close', () => {
+      console.log(`[device-gateway] device disconnected: ${deviceId}`);
       connections.delete(deviceId);
       db.update(devices)
         .set({ online: false })

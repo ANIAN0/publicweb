@@ -5,7 +5,7 @@ import type { InputResponse } from './events';
 // （修复 REV-005-9：移除永不触发的 JSON ping/pong，避免误导）
 export type WsToClient =
   // session.start：启动/续接 session；backendSessionRef 透传给 client 走 resume（server 从 sessions.localSessionRef 读）
-  | { type: 'session.start'; sessionId: string; backend: 'claudecode' | 'pi'; model: string; history: ChatMessage[]; backendSessionRef?: string }
+  | { type: 'session.start'; sessionId: string; backend: 'claudecode' | 'pi'; model: string; history: ChatMessage[]; backendSessionRef?: string; cwd?: string }
   // session.send：发消息；inputResponses 用于回答 HITL（claude AskUserQuestion / pi extension_ui_request）
   | { type: 'session.send';  sessionId: string; content: string; inputResponses?: InputResponse[] }
   | { type: 'session.stop';  sessionId: string }

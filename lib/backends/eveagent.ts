@@ -1,5 +1,6 @@
 import { Client, MessageResponse } from 'eve/client';
 import { BackendAdapter, ChatMessage, ExecutionTarget } from './types';
+import { parseAuthConfig } from './eve-auth';
 import { WebtoolEvent, type WebtoolMessageMetadata, type InputResponse } from '../protocol/events';
 import { eventBus } from './event-bus';
 import { getDb } from '../db/client';
@@ -28,14 +29,13 @@ function eveLog(msg: string): void {
 //   none   → {}                                  无认证
 // 返回结构对齐 eve ClientAuth/HeadersValue(eve client #resolveAuthHeaders/#resolveHeaders 消费)
 function buildClientOptions(authType: string, authConfig: string | null): { auth?: { bearer: string }; headers?: Record<string, string> } {
-  if (!authConfig) return {};
-  let cfg: any;
-  try { cfg = JSON.parse(authConfig); } catch { return {}; }  // 损坏配置当无 auth
-  if (authType === 'bearer' && typeof cfg?.token === 'string' && cfg.token.length > 0) {
-    return { auth: { bearer: cfg.token } };
+  // 复用 eve-auth.parseAuthConfig:解析 + 空值过滤统一,与 validateAuth 两处一致(buildClientOptions + 编辑回显共用)
+  const parsed = parseAuthConfig(authConfig);
+  if (authType === 'bearer' && parsed?.token) {
+    return { auth: { bearer: parsed.token } };
   }
-  if (authType === 'headers' && cfg?.headers && typeof cfg.headers === 'object') {
-    return { headers: cfg.headers as Record<string, string> };
+  if (authType === 'headers' && parsed?.headers) {
+    return { headers: parsed.headers };
   }
   return {};
 }
@@ -92,7 +92,7 @@ export class EveagentBackend implements BackendAdapter {
     const targets = await Promise.all(rows.map(async (svc) => {
       // 按 serviceId 取(或建)带 auth 的 Client,probe 走 client.fetch 自动注入 auth 头
       const client = this.getClient(svc.id, svc.host, svc.authType, svc.authConfig);
-      const online = await this.probe(client);
+      const online = await this.probe(client, svc.host);
       return {
         id: svc.id,
         name: svc.name,
@@ -109,11 +109,18 @@ export class EveagentBackend implements BackendAdapter {
   // 用 client.fetch 而非 client.info():info() 校验响应体 schema,401/非 JSON 抛错;fetch 只发请求不校验,符合"任何响应=在线"。
   // 超时 10s:云端 eve(hf.space)首次请求含 DNS+TLS 握手+冷启动,2s 易误判离线
   // (实测首次 ~2s+ 超时,热连接 ~1.8s)。probe 并发(Promise.all),10s 是总上限非 N×10s。
-  private async probe(client: Client): Promise<boolean> {
+  private async probe(client: Client, host: string): Promise<boolean> {
     try {
       await client.fetch('/info', { signal: AbortSignal.timeout(10000) });
       return true;
-    } catch {
+    } catch (err: any) {
+      // [eve] 探活失败必须落日志:网络层(代理缺失/超时/DNS/TLS)与 auth 失败都要可见,
+      // 否则"连不上且无报错"导致反复排查(AGENTS.md §13:加日志落文件,关键字检索)
+      // err.code 覆盖 Node 网络错误(ETIMEDOUT/ENOTFOUND/ECONNREFUSED),err.name 覆盖 AbortError
+      const code = err?.code ?? err?.name ?? 'unknown';
+      const msg = (err?.message ?? String(err)).slice(0, 200);
+      eveLog(`probe failed host=${host} code=${code} msg=${msg}`);
+      console.error(`[eve] probe failed host=${host} code=${code} msg=${msg}`);
       return false;
     }
   }
@@ -159,20 +166,22 @@ export class EveagentBackend implements BackendAdapter {
     const db = await getDb();
     const history = await this.loadHistoryForContext(sessionId);
 
-    // 读 session 行:resume 标识 + targetId(= eve_service.id,用于取 host+auth)
-    const [sessRow] = await db.select({
+    // 一次 leftJoin 取 session + 关联 eve 服务(host+auth),替代原来两次独立 select(热路径减半查询)
+    // service 已删时 host 为 null(原 svc 查不到),保留 throw 语义
+    const [row] = await db.select({
       eveSessionId: sessions.eveSessionId,
       eveContinuationToken: sessions.eveContinuationToken,
       streamIndex: sessions.streamIndex,
       targetId: sessions.targetId,
-    }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
-    if (!sessRow) throw new Error(`Session ${sessionId} not found`);
-
-    // 取 eve 服务(host + auth),按 serviceId 缓存带 auth 的 Client
-    const [svc] = await db.select({ host: eveServices.host, authType: eveServices.authType, authConfig: eveServices.authConfig })
-      .from(eveServices).where(eq(eveServices.id, sessRow.targetId)).limit(1);
-    if (!svc) throw new Error(`eve service not found: ${sessRow.targetId}`);
-    const client = this.getClient(sessRow.targetId, svc.host, svc.authType, svc.authConfig);
+      host: eveServices.host,
+      authType: eveServices.authType,
+      authConfig: eveServices.authConfig,
+    }).from(sessions)
+      .leftJoin(eveServices, eq(sessions.targetId, eveServices.id))
+      .where(eq(sessions.id, sessionId)).limit(1);
+    if (!row) throw new Error(`Session ${sessionId} not found`);
+    if (!row.host || !row.targetId) throw new Error(`eve service not found: ${row.targetId ?? '(no target)'}`);
+    const client = this.getClient(row.targetId, row.host, row.authType ?? 'none', row.authConfig);
 
     // resume eve durable session:从 db 取上次 turn 持久化的 sessionId + continuationToken,
     // 喂给 client.session(state)。否则每次 client.session() 都新建会话,HITL 回答(inputResponses-only)
@@ -180,22 +189,33 @@ export class EveagentBackend implements BackendAdapter {
     // 返回 null,抛 "Session.send requires a non-empty message, inputResponses, or both"
     // (eve client/session.ts:345-355:inputResponses 必须配 continuationToken 才能构造 body)
     // streamIndex 从 db 读(替代硬编码 0):eve client #createEventStream 用 state.streamIndex 作 startIndex 续接(session.ts:166)
-    const sessionState = sessRow.eveSessionId
-      ? { sessionId: sessRow.eveSessionId, continuationToken: sessRow.eveContinuationToken ?? undefined, streamIndex: sessRow.streamIndex ?? 0 }
+    // [修复 continuationToken 400] sessionId 有但 continuationToken 缺失时,eve client #postTurn
+    // 仍按 sessionId 走续接路径(POST /eve/v1/session/<id>),但 createHandleMessageBody 不把
+    // undefined 的 continuationToken 放进 body -> 服务端 400 "Missing or empty 'continuationToken' field"
+    // 缺 token 本就无法 resume,回退新建会话(clientContext 传历史保持上下文),并清失效的 eveSessionId 防再命中
+    const canResume = Boolean(row.eveSessionId && row.eveContinuationToken);
+    const sessionState = canResume
+      ? { sessionId: row.eveSessionId!, continuationToken: row.eveContinuationToken!, streamIndex: row.streamIndex ?? 0 }
       : undefined;
+    if (row.eveSessionId && !canResume) {
+      eveLog(`continuationToken missing sid=${sessionId} eveSessionId=${row.eveSessionId} -> 回退新建会话,清除失效引用`);
+      await db.update(sessions)
+        .set({ eveSessionId: null, eveContinuationToken: null, streamIndex: 0 })
+        .where(eq(sessions.id, sessionId));
+    }
     if (sessionState) {
       eveLog(`resume sid=${sessionId} eveSessionId=${sessionState.sessionId} hasToken=${sessionState.continuationToken !== undefined} streamIndex=${sessionState.streamIndex} inputResponsesLen=${inputResponses?.length ?? 0}`);
     }
     const clientSession = client.session(sessionState);
     // eventCount 对齐 eve client currentStreamIndex(session.ts:182):从 db streamIndex 起始,每消费一个 eve event +1
-    const eventCountStart = sessRow.streamIndex ?? 0;
+    const eventCountStart = row.streamIndex ?? 0;
 
     const clientContext = history.length > 0
       ? JSON.stringify(history.map((m) => ({ role: m.role, content: m.content })))
       : undefined;
 
     // [eve] 记录请求：host + content 预览 + history 条数 + clientContext 长度 + inputResponses 条数
-    eveLog(`runTurn sid=${sessionId} host=${svc.host} content=${JSON.stringify(content.slice(0, 50))} historyLen=${history.length} clientContextLen=${clientContext?.length ?? 0} inputResponsesLen=${inputResponses?.length ?? 0}`);
+    eveLog(`runTurn sid=${sessionId} host=${row.host} content=${JSON.stringify(content.slice(0, 50))} historyLen=${history.length} clientContextLen=${clientContext?.length ?? 0} inputResponsesLen=${inputResponses?.length ?? 0}`);
 
     // eve client send 允许只有 inputResponses 无 message(HITL 回答);content 为空时传 undefined
     // (session.ts 校验:message 或 inputResponses 至少一个非空)
@@ -379,14 +399,19 @@ export class EveagentBackend implements BackendAdapter {
   // 实际 resume 追回逻辑(由 resume 加锁后调用)
   private async doResume(sessionId: string, signal: AbortSignal): Promise<void> {
     const db = await getDb();
-    // 读 db session state(eveSessionId, continuationToken, streamIndex, pendingUserMessage, targetId)
+    // 读 db session state + 关联 eve 服务(host+auth)一次 leftJoin 取齐(对齐 runTurn,减一次查询)
     const [sessRow] = await db.select({
       eveSessionId: sessions.eveSessionId,
       eveContinuationToken: sessions.eveContinuationToken,
       streamIndex: sessions.streamIndex,
       pendingUserMessage: sessions.pendingUserMessage,
       targetId: sessions.targetId,
-    }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
+      host: eveServices.host,
+      authType: eveServices.authType,
+      authConfig: eveServices.authConfig,
+    }).from(sessions)
+      .leftJoin(eveServices, eq(sessions.targetId, eveServices.id))
+      .where(eq(sessions.id, sessionId)).limit(1);
 
     // 无 eve session(尚未 send 过)→ 无法 resume
     if (!sessRow?.eveSessionId) {
@@ -427,14 +452,12 @@ export class EveagentBackend implements BackendAdapter {
       return;
     }
 
-    // 取 eve 服务(host + auth),按 serviceId 缓存带 auth 的 Client(对齐 runTurn)
-    const [svc] = await db.select({ host: eveServices.host, authType: eveServices.authType, authConfig: eveServices.authConfig })
-      .from(eveServices).where(eq(eveServices.id, sessRow.targetId)).limit(1);
-    if (!svc) {
+    // eve 服务(host+auth)已随上面 leftJoin 取到:无 service(host 为 null)→ 跳过
+    if (!sessRow.host || !sessRow.targetId) {
       eveLog(`resume skip sid=${sessionId} reason=no-service`);
       return;
     }
-    const client = this.getClient(sessRow.targetId, svc.host, svc.authType, svc.authConfig);
+    const client = this.getClient(sessRow.targetId, sessRow.host, sessRow.authType ?? 'none', sessRow.authConfig);
 
     const streamIndex = sessRow.streamIndex ?? 0;
     // sessionState 喂 client.session:eve client #streamAndAdvance 用 startIndex 覆盖 state.streamIndex 追回

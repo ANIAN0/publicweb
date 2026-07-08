@@ -25,14 +25,9 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogFooter,
-  DialogTitle,
-  DialogDescription,
-} from '@/components/ui/dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { formatRelative } from '@/lib/utils';
+import { BACKEND_LABEL } from '@/lib/backends/labels';
 
 // 列表项类型,与 GET /api/sessions 返回对齐
 interface SessionItem {
@@ -50,13 +45,6 @@ interface SessionItem {
 }
 
 type BackendFilter = '' | 'eveagent' | 'claudecode' | 'pi';
-
-// 后端显示名(徽标 + 筛选 chip 共用)
-const BACKEND_LABEL: Record<Exclude<BackendFilter, ''>, string> = {
-  eveagent: 'Eveagent',
-  claudecode: 'Claude Code',
-  pi: 'Pi',
-};
 
 // 按日期分组:今天 / 昨天 / 具体日期(参考 open-agents session-list 的分组逻辑)
 function groupByDate(items: SessionItem[]): Map<string, SessionItem[]> {
@@ -85,18 +73,7 @@ function groupByDate(items: SessionItem[]): Map<string, SessionItem[]> {
   return groups;
 }
 
-// 相对时间格式化:刚刚 / N 分钟前 / N 小时前 / N 天前 / 具体日期
-function formatRelative(date: Date): string {
-  const diff = Date.now() - date.getTime();
-  const min = Math.floor(diff / 60000);
-  if (min < 1) return '刚刚';
-  if (min < 60) return `${min} 分钟前`;
-  const hour = Math.floor(min / 60);
-  if (hour < 24) return `${hour} 小时前`;
-  const day = Math.floor(hour / 24);
-  if (day < 7) return `${day} 天前`;
-  return date.toLocaleDateString('zh-CN');
-}
+// 相对时间格式化(formatRelative)与 BACKEND_LABEL 已抽到 lib/utils 与 lib/backends/labels,首页直接 import
 
 export default function Home() {
   const [items, setItems] = useState<SessionItem[]>([]);
@@ -135,7 +112,7 @@ export default function Home() {
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       {/* 顶部:标题 + 操作按钮 */}
-      <header className="flex items-center justify-between px-6 py-4">
+      <header className="sticky top-0 z-10 flex items-center justify-between border-b bg-background px-6 py-4">
         <span className="text-lg font-semibold">通用 ChatUI</span>
         <div className="flex items-center gap-2">
           {/* 用 buttonVariants 给 Link 加按钮样式,避免 a/button 嵌套 */}
@@ -161,7 +138,7 @@ export default function Home() {
       </header>
 
       {/* 筛选 + 搜索 */}
-      <div className="flex flex-wrap items-center gap-2 px-6 pb-4">
+      <div className="flex flex-wrap items-center gap-2 px-6 pt-4 pb-4">
         <div className="flex gap-1">
           <Button
             variant={backend === '' ? 'secondary' : 'ghost'}
@@ -197,7 +174,7 @@ export default function Home() {
       </div>
 
       {/* 列表 / 空状态 / loading */}
-      <main className="flex-1 overflow-y-auto px-6 pb-8">
+      <main className="min-h-0 flex-1 overflow-y-auto px-6 pb-8">
         {loading ? (
           <div className="py-12 text-center text-sm text-muted-foreground">
             加载中...
@@ -388,37 +365,18 @@ function SessionRow({
         )}
       </div>
 
-      {/* 删除/清理二次确认:用 shadcn Dialog。targetDeleted=true 时显示"清理"文案,否则"删除" */}
-      <Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              {item.targetDeleted ? '清理已删 target 的会话?' : '删除会话?'}
-            </DialogTitle>
-            <DialogDescription>
-              {item.targetDeleted
-                ? `「${displayTitle}」关联的 target 已被删除,此操作仅清理该会话记录,历史消息保留在数据库中。`
-                : `确定要删除「${displayTitle}」吗?此操作不可恢复。`}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setConfirmDelete(false)}
-              disabled={busy}
-            >
-              取消
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={confirmDeleteAction}
-              disabled={busy}
-            >
-              {item.targetDeleted ? '清理' : '删除'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* 删除/清理二次确认:targetDeleted=true 时显示"清理"文案,否则"删除" */}
+      <ConfirmDialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        title={item.targetDeleted ? '清理已删 target 的会话?' : '删除会话?'}
+        description={item.targetDeleted
+          ? `「${displayTitle}」关联的 target 已被删除,此操作仅清理该会话记录,历史消息保留在数据库中。`
+          : `确定要删除「${displayTitle}」吗?此操作不可恢复。`}
+        confirmText={item.targetDeleted ? '清理' : '删除'}
+        busy={busy}
+        onConfirm={confirmDeleteAction}
+      />
     </>
   );
 }

@@ -27,6 +27,8 @@ export class LocalBackend implements BackendAdapter {
   private sessionToTarget = new Map<string, string>();
   // sessionId → EventBus unsubscribe(startSession 时挂订阅,stop 时清理)
   private sessionUnsubscribers = new Map<string, () => void>();
+  // sessionId -> persist 串行链(part 事件并发 emit 时,串行 persist 防 nextSeq 撞 UNIQUE)
+  private persistChains = new Map<string, Promise<void>>();
 
   async listTargets(): Promise<ExecutionTarget[]> {
     const db = await getDb();
@@ -56,7 +58,7 @@ export class LocalBackend implements BackendAdapter {
     }));
   }
 
-  async startSession(opts: { sessionId: string; model: string; targetId: string; history: ChatMessage[] }): Promise<void> {
+  async startSession(opts: { sessionId: string; model: string; targetId: string; history: ChatMessage[]; cwd?: string }): Promise<void> {
     const db = await getDb();
     const [device] = await db.select().from(devices).where(eq(devices.id, opts.targetId)).limit(1);
     if (!device) throw new Error(`device not found: ${opts.targetId}`);
@@ -73,6 +75,7 @@ export class LocalBackend implements BackendAdapter {
       model: opts.model,
       history: opts.history,
       backendSessionRef: sess?.localSessionRef ?? undefined,  // 透传 resume 引用
+      cwd: opts.cwd,              // 透传工作目录(空则 client 用运行目录)
     });
     if (!ok) throw new Error(`device not connected: ${opts.targetId}`);
 
@@ -81,9 +84,14 @@ export class LocalBackend implements BackendAdapter {
     // 订阅全局事件总线:device-gateway 收到 client 上行的 session.event 后 emit,
     // 这里订阅一份用于持久化(修复 REV-005-1)。失败不影响 sendToDevice 已成功。
     const unsub = sessionEventBus.subscribe(opts.sessionId, (event: WebtoolEvent) => {
-      persistSessionEvent(opts.sessionId, event).catch((err) => {
-        console.error(`[local] persist failed sid=${opts.sessionId}:`, err);
-      });
+      // emit 同步触发回调但 persistSessionEvent 是 async;不串行则多个 part 事件并发跑
+      // getOrCreateCurrentAssistant,都查到相同 lastSeq -> 算出相同 nextSeq -> 撞 messages.(session_id,seq) UNIQUE
+      // 用 per-session promise 链串行化:前一个 persist 完成再跑下一个
+      const prev = this.persistChains.get(opts.sessionId) ?? Promise.resolve();
+      const next = prev
+        .then(() => persistSessionEvent(opts.sessionId, event))
+        .catch((err) => console.error(`[local] persist failed sid=${opts.sessionId}:`, err));
+      this.persistChains.set(opts.sessionId, next);
     });
     this.sessionUnsubscribers.set(opts.sessionId, unsub);
   }
@@ -125,6 +133,7 @@ export class LocalBackend implements BackendAdapter {
     // 清理事件订阅;防止 session 删了订阅还残留导致内存泄漏
     this.sessionUnsubscribers.get(sessionId)?.();
     this.sessionUnsubscribers.delete(sessionId);
+    this.persistChains.delete(sessionId);  // 清理 persist 串行链(链上 in-flight 的 persist 仍会跑完,但不再加新事件)
   }
 
   onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId?: number) => void, sinceEventId?: number): () => void {

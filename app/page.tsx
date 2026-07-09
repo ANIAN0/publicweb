@@ -28,6 +28,9 @@ import {
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatRelative } from '@/lib/utils';
 import { BACKEND_LABEL } from '@/lib/backends/labels';
+import { SkeletonList } from '@/components/layout/Skeleton';
+import { EmptyState } from '@/components/layout/EmptyState';
+import { ErrorBanner } from '@/components/layout/ErrorBanner';
 
 // 列表项类型,与 GET /api/sessions 返回对齐
 interface SessionItem {
@@ -78,6 +81,7 @@ function groupByDate(items: SessionItem[]): Map<string, SessionItem[]> {
 export default function Home() {
   const [items, setItems] = useState<SessionItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [backend, setBackend] = useState<BackendFilter>('');
   // 输入框实时值与 debounce 后的生效值分离,避免每次按键都发请求
   const [qInput, setQInput] = useState('');
@@ -96,11 +100,13 @@ export default function Home() {
     if (backend) params.set('backend', backend);
     if (q) params.set('q', q);
     setLoading(true);
+    setError(null);
     fetch(`/api/sessions?${params.toString()}`, { signal: ac.signal })
       .then((r) => r.json() as Promise<SessionItem[]>)
       .then((data) => setItems(data))
       .catch((err) => {
-        if (err.name !== 'AbortError') console.error('list sessions error:', err);
+        // AbortError 是组件卸载/筛选切换触发的正常取消,不算错误
+        if (err.name !== 'AbortError') setError('加载会话失败,请重试');
       })
       .finally(() => setLoading(false));
     return () => ac.abort();
@@ -175,17 +181,27 @@ export default function Home() {
 
       {/* 列表 / 空状态 / loading */}
       <main className="min-h-0 flex-1 overflow-y-auto px-6 pb-8">
-        {loading ? (
-          <div className="py-12 text-center text-sm text-muted-foreground">
-            加载中...
-          </div>
+        {error ? (
+          <ErrorBanner message={error} onRetry={reload} retrying={loading} />
+        ) : loading ? (
+          <SkeletonList count={5} />
         ) : items.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
-            <MessageSquare className="size-8 text-muted-foreground/40" />
-            <p className="text-sm text-muted-foreground">
-              {q || backend ? '没有匹配的会话' : '暂无会话,点击"新会话"开始'}
-            </p>
-          </div>
+          <EmptyState
+            icon={<MessageSquare className="size-8" />}
+            title={q || backend ? '没有匹配的会话' : '暂无会话'}
+            description={q || backend ? '试试调整筛选或搜索词' : '点击下方按钮开始第一次对话'}
+            action={
+              q || backend ? (
+                <Button variant="outline" size="sm" onClick={() => { setBackend(''); setQInput(''); }}>
+                  清空筛选
+                </Button>
+              ) : (
+                <Link href="/sessions/new" className={buttonVariants({ variant: 'default', size: 'sm' })}>
+                  <Plus className="size-4" /> 新会话
+                </Link>
+              )
+            }
+          />
         ) : (
           <div className="mx-auto max-w-3xl space-y-6">
             {Array.from(groups.entries()).map(([key, groupItems]) => (
@@ -334,7 +350,7 @@ function SessionRow({
         {!renaming && (
           <DropdownMenu>
             <DropdownMenuTrigger
-              className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}
+              className={buttonVariants({ variant: 'ghost', size: 'icon-sm', className: 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100' })}
             >
               <MoreHorizontal className="size-4" />
             </DropdownMenuTrigger>

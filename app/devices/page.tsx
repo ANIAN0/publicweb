@@ -5,7 +5,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Card } from '@/components/ui/card';
 import { Spinner } from '@/components/ui/spinner';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
@@ -20,6 +19,9 @@ import Link from 'next/link';
 import AddDeviceDialog from './_components/AddDeviceDialog';
 import { formatRelative } from '@/lib/utils';
 import { backendLabel } from '@/lib/backends/labels';
+import { SkeletonList } from '@/components/layout/Skeleton';
+import { EmptyState } from '@/components/layout/EmptyState';
+import { ErrorBanner } from '@/components/layout/ErrorBanner';
 
 interface DeviceModel { id: string; label: string; isDefault?: boolean }
 interface DeviceModels { backend: string; models: DeviceModel[]; refreshedAt: string | null }
@@ -89,7 +91,7 @@ export default function DevicesPage() {
       const res = await fetch(`/api/devices/${deviceId}/refresh-models`, { method: 'POST' });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        alert(`刷新模型失败: ${err.error ?? res.status}`);
+        setError(`刷新模型失败: ${err.error ?? res.status}`);
         return;
       }
       // 刷新后重新拉模型
@@ -99,7 +101,7 @@ export default function DevicesPage() {
         setDeviceModels((prev) => ({ ...prev, [deviceId]: data }));
       }
     } catch (err) {
-      alert('刷新模型失败: 网络错误');
+      setError('刷新模型失败: 网络错误');
     }
   };
 
@@ -111,13 +113,13 @@ export default function DevicesPage() {
       const res = await fetch(`/api/devices/${deleteTarget.id}`, { method: 'DELETE' });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        alert(`删除失败: ${err.error ?? res.status}`);
+        setError(`删除失败: ${err.error ?? res.status}`);
         return;
       }
       setDeleteTarget(null);
       fetchDevices();
     } catch {
-      alert('删除失败: 网络错误');
+      setError('删除失败: 网络错误');
     } finally {
       setDeleting(false);
     }
@@ -146,38 +148,33 @@ export default function DevicesPage() {
       </header>
 
       {/* 错误态 */}
-      {error && (
-        <div className="mx-6 mb-4 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive flex items-center justify-between">
-          <span>{error}</span>
-          <Button variant="ghost" size="sm" onClick={fetchDevices}>重试</Button>
-        </div>
-      )}
+      {error && <ErrorBanner message={error} onRetry={fetchDevices} retrying={loading} />}
 
       {/* 列表 / 加载态 / 空状态 */}
       <main className="min-h-0 flex-1 overflow-y-auto px-6 pt-4 pb-8">
         {loading ? (
-          <div className="py-12 text-center text-sm text-muted-foreground">
-            <Spinner className="mx-auto size-6 mb-2" />
-            加载中...
-          </div>
+          <SkeletonList count={4} />
         ) : devices.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
-            <Cpu className="size-8 text-muted-foreground/40" />
-            <p className="text-sm text-muted-foreground">暂无设备</p>
-            <Button variant="outline" size="sm" onClick={() => setShowAddDialog(true)}>
-              <Plus className="size-4" /> 添加第一台设备
-            </Button>
-          </div>
+          <EmptyState
+            icon={<Cpu className="size-8" />}
+            title="暂无设备"
+            description="添加一台设备以连接本地客户端"
+            action={
+              <Button variant="outline" size="sm" onClick={() => setShowAddDialog(true)}>
+                <Plus className="size-4" /> 添加第一台设备
+              </Button>
+            }
+          />
         ) : (
-          <div className="mx-auto max-w-3xl space-y-2">
+          <div className="mx-auto max-w-3xl space-y-1">
             {devices.map((device) => (
-              <Card key={device.id} className="p-4">
+              <div key={device.id} className="group rounded-lg px-3 py-2.5 transition-colors hover:bg-muted/50">
                 <div className="flex items-center justify-between">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="font-medium truncate">{device.name}</span>
                       {device.online ? (
-                        <Badge variant="default" className="bg-green-500/10 text-green-600 border-green-500/20">
+                        <Badge variant="success">
                           <CheckCircle2 className="size-3 mr-1" /> 在线
                         </Badge>
                       ) : (
@@ -199,7 +196,7 @@ export default function DevicesPage() {
                     </div>
                   </div>
                   <DropdownMenu>
-                    <DropdownMenuTrigger className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}>
+                    <DropdownMenuTrigger className={buttonVariants({ variant: 'ghost', size: 'icon-sm', className: 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100' })}>
                       <MoreHorizontal className="size-4" />
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
@@ -243,7 +240,7 @@ export default function DevicesPage() {
                     )}
                   </div>
                 )}
-              </Card>
+              </div>
             ))}
           </div>
         )}

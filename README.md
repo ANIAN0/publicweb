@@ -45,7 +45,6 @@ webtool/
 ├── components/chat/              # 聊天 UI 组件
 │   ├── ConfirmDialog.tsx         #   确认弹窗（如删除会话）
 │   ├── InterruptBanner.tsx       #   中断/断连横幅
-│   └── ToolCallCard.tsx          #   工具调用展示卡
 │
 ├── lib/                          # 后端业务逻辑（与 Next 框架解耦，可单测）
 │   ├── backends/                 #   后端适配器层（统一 BackendAdapter 接口）

@@ -6,7 +6,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Spinner } from '@/components/ui/spinner';
 import {
@@ -22,6 +21,9 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Cloud, Plus, MoreHorizontal, Trash2, Pencil, RefreshCw, CheckCircle2, XCircle, ArrowLeft, Eye, EyeOff } from 'lucide-react';
 import Link from 'next/link';
 import { parseAuthConfig } from '@/lib/backends/eve-auth';
+import { SkeletonList } from '@/components/layout/Skeleton';
+import { EmptyState } from '@/components/layout/EmptyState';
+import { ErrorBanner } from '@/components/layout/ErrorBanner';
 
 interface EveService {
   id: string;
@@ -89,7 +91,7 @@ export default function EveServicesPage() {
     setDeleting(true);
     try {
       const res = await fetch(`/api/eve-services/${deleteTarget.id}`, { method: 'DELETE' });
-      if (!res.ok) { alert('删除失败'); return; }
+      if (!res.ok) { setError('删除失败'); return; }
       setDeleteTarget(null);
       fetchServices();
     } finally { setDeleting(false); }
@@ -116,36 +118,32 @@ export default function EveServicesPage() {
         </div>
       </header>
 
-      {error && (
-        <div className="mx-6 mt-4 mb-4 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive flex items-center justify-between">
-          <span>{error}</span>
-          <Button variant="ghost" size="sm" onClick={fetchServices}>重试</Button>
-        </div>
-      )}
+      {error && <ErrorBanner message={error} onRetry={fetchServices} retrying={loading} />}
 
       <main className="min-h-0 flex-1 overflow-y-auto px-6 pt-4 pb-8">
         {loading ? (
-          <div className="py-12 text-center text-sm text-muted-foreground">
-            <Spinner className="mx-auto size-6 mb-2" />加载中...
-          </div>
+          <SkeletonList count={4} />
         ) : services.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
-            <Cloud className="size-8 text-muted-foreground/40" />
-            <p className="text-sm text-muted-foreground">暂无 eve 服务</p>
-            <Button variant="outline" size="sm" onClick={() => setDialogTarget('add')}>
-              <Plus className="size-4" /> 添加第一个服务
-            </Button>
-          </div>
+          <EmptyState
+            icon={<Cloud className="size-8" />}
+            title="暂无 eve 服务"
+            description="添加一个 eve 服务端点以连接云端 agent"
+            action={
+              <Button variant="outline" size="sm" onClick={() => setDialogTarget('add')}>
+                <Plus className="size-4" /> 添加第一个服务
+              </Button>
+            }
+          />
         ) : (
-          <div className="mx-auto max-w-3xl space-y-2">
+          <div className="mx-auto max-w-3xl space-y-1">
             {services.map((svc) => (
-              <Card key={svc.id} className="p-4">
+              <div key={svc.id} className="group rounded-lg px-3 py-2.5 transition-colors hover:bg-muted/50">
                 <div className="flex items-center justify-between">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="font-medium truncate">{svc.name}</span>
                       {svc.online === true ? (
-                        <Badge variant="default" className="bg-green-500/10 text-green-600 border-green-500/20">
+                        <Badge variant="success">
                           <CheckCircle2 className="size-3 mr-1" /> 在线
                         </Badge>
                       ) : svc.online === false ? (
@@ -161,7 +159,7 @@ export default function EveServicesPage() {
                     </div>
                   </div>
                   <DropdownMenu>
-                    <DropdownMenuTrigger className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}>
+                    <DropdownMenuTrigger className={buttonVariants({ variant: 'ghost', size: 'icon-sm', className: 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100' })}>
                       <MoreHorizontal className="size-4" />
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
@@ -178,7 +176,7 @@ export default function EveServicesPage() {
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </div>
-              </Card>
+              </div>
             ))}
           </div>
         )}

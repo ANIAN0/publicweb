@@ -47,16 +47,16 @@ export function ConfirmDialog({
       onClick={onCancel}
     >
       <div
-        className="bg-white dark:bg-zinc-900 rounded-lg shadow-lg max-w-sm w-full p-6"
+        className="bg-background rounded-lg shadow-lg max-w-sm w-full p-6"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold mb-2">{title}</h2>
-        <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-6">{message}</p>
+        <p className="text-sm text-muted-foreground mb-6">{message}</p>
         <div className="flex justify-end gap-2">
           <button
             type="button"
             onClick={onCancel}
-            className="px-4 py-2 text-sm border rounded hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            className="px-4 py-2 text-sm border rounded hover:bg-muted"
           >
             {cancelText}
           </button>
@@ -66,8 +66,8 @@ export function ConfirmDialog({
             onClick={onConfirm}
             className={`px-4 py-2 text-sm text-white rounded ${
               destructive
-                ? 'bg-red-500 hover:bg-red-600'
-                : 'bg-blue-500 hover:bg-blue-600'
+                ? 'bg-destructive hover:bg-destructive/80'
+                : 'bg-primary text-primary-foreground hover:bg-primary/80'
             }`}
           >
             {confirmText}

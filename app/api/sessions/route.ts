@@ -43,7 +43,7 @@ export async function POST(request: NextRequest) {
   const now = new Date();
   const db = await getDb();
 
-  // 创建 session 记录 + 启动:任一失败回滚 + 500 + 打日志定位根因(AGENTS.md 第 13 条)
+  // 创建 session 记录 + 启动：任一失败回滚，并记录可定位的服务端日志。
   // insert 失败常见于 schema 变更后未跑 migration(如 cwd 列缺失);startSession 失败常见于设备 WS 断连
   try {
     await db.insert(sessions).values({

@@ -43,8 +43,10 @@ webtool/
 │   └── favicon.ico
 │
 ├── components/chat/              # 聊天 UI 组件
-│   ├── ConfirmDialog.tsx         #   确认弹窗（如删除会话）
 │   ├── InterruptBanner.tsx       #   中断/断连横幅
+│   └── …                         #   消息、工具调用等组件
+├── components/ui/                # 通用 UI 原语
+│   └── confirm-dialog.tsx        #   确认弹窗（如删除会话）
 │
 ├── lib/                          # 后端业务逻辑（与 Next 框架解耦，可单测）
 │   ├── backends/                 #   后端适配器层（统一 BackendAdapter 接口）
@@ -80,7 +82,7 @@ webtool/
 ├── instrumentation.ts            # Next 启动钩子：nodejs runtime 下跑 drizzle migrate
 ├── next.config.ts                # Next 配置：声明 @tursodatabase/database 为 serverExternalPackages（已去除 withEve 宿主包装）
 ├── drizzle.config.ts             # drizzle-kit 配置（schema=./lib/db/schema.ts, out=./drizzle, dialect=sqlite）
-├── package.json                  # 依赖与脚本（dev/start = tsx server.ts；build = next build；test = vitest）
+├── package.json                  # 依赖与脚本（dev/start = tsx server.ts；build = next build；wipe:sessions = 清空会话与消息）
 ├── pnpm-lock.yaml                # pnpm 锁文件
 ├── pnpm-workspace.yaml           # 仅声明 ignoredBuiltDependencies（sharp / unrs-resolver）；非真正 workspace 根
 ├── tsconfig.json                 # TypeScript 配置
@@ -107,6 +109,17 @@ pnpm dev      # = tsx server.ts，启动 Next + WS 网关于 http://localhost:30
 ```
 
 `dev` 与 `start` 都走 `tsx server.ts`（自定义 server），不是 `next dev`——因为 WS 网关必须挂在同一 HTTP 端口上。启动时 `instrumentation.ts` 自动应用 `drizzle/` 下的迁移。
+
+### 清空会话与消息（保留接入配置）
+
+M-006 / C-009：半成品会话数据可一次性清空；**不删** devices 与 eve_services。
+
+```bash
+pnpm wipe:sessions -- --dry-run   # 只统计，不写库
+pnpm wipe:sessions                # DELETE turn_locks + messages + sessions
+```
+
+脚本：`scripts/wipe-sessions-messages.ts`。DB 路径同 `DATABASE_URL`（默认 `./data/webtool.db`）。
 
 ## 三类后端如何被路由
 

@@ -1,3 +1,6 @@
+# WS-025：本文件原为 pnpm 构建忽略配置（非 monorepo packages 列表）。
+# webtool 是独立包；webtool-clients 在上级目录另一 package，不由本 workspace 管理。
+# 保留 ignoredBuiltDependencies 避免 sharp/unrs-resolver 本地编译噪音。
 ignoredBuiltDependencies:
   - sharp
   - unrs-resolver

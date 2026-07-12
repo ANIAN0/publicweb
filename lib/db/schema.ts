@@ -7,6 +7,21 @@ export const devices = sqliteTable('devices', {
   longLivedTokenHash: text('long_lived_token_hash').notNull(),
   lastSeenAt: integer('last_seen_at', { mode: 'timestamp' }),
   online: integer('online', { mode: 'boolean' }).default(false),
+  // 最近一次 device.heartbeat 快照 JSON：{ sessionCount, uptimeMs, modelsCount, lastError }
+  healthJson: text('health_json'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+});
+
+// client 上报的结构化错误（doctor / devices 页可查）
+export const deviceErrors = sqliteTable('device_errors', {
+  id: text('id').primaryKey(),
+  deviceId: text('device_id').notNull().references(() => devices.id),
+  code: text('code').notNull(),
+  message: text('message').notNull(),
+  category: text('category'),                                   // network | backend | protocol | auth | stall | unknown
+  sessionId: text('session_id'),
+  stack: text('stack'),
+  contextJson: text('context_json'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
@@ -73,6 +88,15 @@ export const sessions = sqliteTable('sessions', {
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   lastActiveAt: integer('last_active_at', { mode: 'timestamp' }).notNull(),
   deletedAt: integer('deleted_at', { mode: 'timestamp' }),
+});
+
+// 每个执行端同一时刻只允许一个活跃 turn。targetKey 使用 `${backend}:${targetId}`，
+// runId 用于防止上一轮迟到终态误释放下一轮锁。
+export const turnLocks = sqliteTable('turn_locks', {
+  targetKey: text('target_key').primaryKey(),
+  sessionId: text('session_id').notNull().references(() => sessions.id),
+  runId: text('run_id').notNull().unique(),
+  acquiredAt: integer('acquired_at', { mode: 'timestamp' }).notNull(),
 });
 
 export const messages = sqliteTable('messages', {

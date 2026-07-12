@@ -1,26 +1,21 @@
 import { Client, MessageResponse } from 'eve/client';
-import { BackendAdapter, ChatMessage, ExecutionTarget } from './types';
-import { parseAuthConfig } from './eve-auth';
+import { BackendAdapter, ChatMessage, ExecutionTarget, MessageAttachmentRef } from './types';
+import { parseAuthConfig, asAuthType, type AuthType } from './eve-auth';
 import { WebtoolEvent, type WebtoolMessageMetadata, type InputResponse } from '../protocol/events';
 import { eventBus } from './event-bus';
 import { getDb } from '../db/client';
 import { sessions, messages, eveServices } from '../db/schema';
-import { eq, and, asc, desc } from 'drizzle-orm';
-import { persistSessionEvent, extractTextFromParts } from './persist';
+import { eq, and, desc } from 'drizzle-orm';
+import { persistSessionEvent } from './persist';
 import { isPendingStale } from './pending';
-import { appendFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { loadConversationHistory } from '@/lib/chat/history';
+import { readAttachmentBuffer } from '../attachments/store';
+import { debugLog } from '../debug-log';
+import { getTurnRunId, settleTurnLock } from './turn-lock';
 
-// [eve] 调试日志：追加到 workplace/logs/eve-YYYYMMDD.log（AGENTS.md 第 13 条调试策略）
-// 同步追加写，日志失败静默吞掉，不影响主流程
+// [eve] 调试日志：异步缓冲写 workplace/logs（LIB-005：禁止热路径 appendFileSync）
 function eveLog(msg: string): void {
-  const ts = new Date().toISOString();
-  const day = ts.slice(0, 10);
-  try {
-    const dir = join(process.cwd(), '..', 'workplace', 'logs');
-    mkdirSync(dir, { recursive: true });
-    appendFileSync(join(dir, `eve-${day}.log`), `${ts} [eve] ${msg}\n`, 'utf8');
-  } catch { /* 日志失败不影响主流程 */ }
+  debugLog('eve', msg);
 }
 
 // 从 db 行的 authType + authConfig 构造 eve ClientOptions 的 auth / headers(明文 token 从 authConfig JSON 读)
@@ -28,7 +23,8 @@ function eveLog(msg: string): void {
 //   headers → { headers: Record<string,string> } 注入自定义请求头(如 x-api-key)
 //   none   → {}                                  无认证
 // 返回结构对齐 eve ClientAuth/HeadersValue(eve client #resolveAuthHeaders/#resolveHeaders 消费)
-function buildClientOptions(authType: string, authConfig: string | null): { auth?: { bearer: string }; headers?: Record<string, string> } {
+// LIB-017：authType 收窄为 AuthType，避免任意 string 穿透
+function buildClientOptions(authType: AuthType, authConfig: string | null): { auth?: { bearer: string }; headers?: Record<string, string> } {
   // 复用 eve-auth.parseAuthConfig:解析 + 空值过滤统一,与 validateAuth 两处一致(buildClientOptions + 编辑回显共用)
   const parsed = parseAuthConfig(authConfig);
   if (authType === 'bearer' && parsed?.token) {
@@ -40,23 +36,88 @@ function buildClientOptions(authType: string, authConfig: string | null): { auth
   return {};
 }
 
-// 剥离 action,只保留前端 UI 可见的 inputRequest 字段(对齐 eve client toMessageInputRequest)
-// 前端 InputRequestCard 据此渲染:prompt 问题文案 + display 三态 + options 选项 + allowFreeform 自定义文本
-// 注意:options 用 mutable 数组(AI SDK toolMetadata 是 JSONValue,不接受 readonly JSONArray)
-function toMessageInputRequest(request: any): {
+// LIB-007：HITL request 窄化后的 UI 可见字段（对齐 eve client toMessageInputRequest）
+// 前端 InputRequestCard：prompt + display 三态 + options + allowFreeform
+type MessageInputRequestView = {
   requestId: string;
   prompt: string;
   display?: 'confirmation' | 'select' | 'text';
   options?: { id: string; label: string; description?: string; style?: 'danger' | 'default' | 'primary' }[];
   allowFreeform?: boolean;
-} {
+};
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null;
+}
+
+/** 从 unknown 窄化为 InputRequest 视图；字段缺失用安全默认，不抛 */
+function toMessageInputRequest(request: unknown): MessageInputRequestView {
+  const r = isRecord(request) ? request : {};
+  const requestId = typeof r.requestId === 'string' ? r.requestId : '';
+  const prompt = typeof r.prompt === 'string' ? r.prompt : '';
+  const display =
+    r.display === 'confirmation' || r.display === 'select' || r.display === 'text'
+      ? r.display
+      : undefined;
+  let options: MessageInputRequestView['options'];
+  if (Array.isArray(r.options)) {
+    options = r.options.map((o, i) => {
+      const opt = isRecord(o) ? o : {};
+      return {
+        id: typeof opt.id === 'string' ? opt.id : String(i),
+        label: typeof opt.label === 'string' ? opt.label : String(opt.id ?? i),
+        ...(typeof opt.description === 'string' ? { description: opt.description } : {}),
+        ...(opt.style === 'danger' || opt.style === 'default' || opt.style === 'primary'
+          ? { style: opt.style }
+          : {}),
+      };
+    });
+  }
+  const allowFreeform = typeof r.allowFreeform === 'boolean' ? r.allowFreeform : undefined;
   return {
-    requestId: request.requestId,
-    prompt: request.prompt,
-    ...(request.display !== undefined ? { display: request.display } : {}),
-    ...(request.options !== undefined ? { options: request.options } : {}),
-    ...(request.allowFreeform !== undefined ? { allowFreeform: request.allowFreeform } : {}),
+    requestId,
+    prompt,
+    ...(display !== undefined ? { display } : {}),
+    ...(options !== undefined ? { options } : {}),
+    ...(allowFreeform !== undefined ? { allowFreeform } : {}),
   };
+}
+
+/** LIB-006：eve NDJSON 事件窄化入口 */
+type EveStreamEvent = {
+  type?: string;
+  data?: Record<string, unknown>;
+};
+
+function asEveEvent(eveEvent: unknown): EveStreamEvent {
+  if (!isRecord(eveEvent)) return {};
+  const data = isRecord(eveEvent.data) ? eveEvent.data : {};
+  return {
+    type: typeof eveEvent.type === 'string' ? eveEvent.type : undefined,
+    data,
+  };
+}
+
+/** LIB-013：合成 partId 时避免 `undefined` 字面串；缺省用 0 / unknown */
+function evePartId(
+  turnId: unknown,
+  stepIndex: unknown,
+  kind: string,
+  extra?: string,
+): string {
+  const turn =
+    typeof turnId === 'string' && turnId.length > 0
+      ? turnId
+      : turnId != null && turnId !== ''
+        ? String(turnId)
+        : 'unknown';
+  const step =
+    typeof stepIndex === 'number' && Number.isFinite(stepIndex)
+      ? stepIndex
+      : typeof stepIndex === 'string' && stepIndex.length > 0
+        ? stepIndex
+        : 0;
+  return extra !== undefined ? `${turn}:${step}:${kind}:${extra}` : `${turn}:${step}:${kind}`;
 }
 
 /**
@@ -91,7 +152,7 @@ export class EveagentBackend implements BackendAdapter {
     // 只有网络错误/超时才算离线
     const targets = await Promise.all(rows.map(async (svc) => {
       // 按 serviceId 取(或建)带 auth 的 Client,probe 走 client.fetch 自动注入 auth 头
-      const client = this.getClient(svc.id, svc.host, svc.authType, svc.authConfig);
+      const client = this.getClient(svc.id, svc.host, asAuthType(svc.authType), svc.authConfig);
       const online = await this.probe(client, svc.host);
       return {
         id: svc.id,
@@ -113,14 +174,12 @@ export class EveagentBackend implements BackendAdapter {
     try {
       await client.fetch('/info', { signal: AbortSignal.timeout(10000) });
       return true;
-    } catch (err: any) {
-      // [eve] 探活失败必须落日志:网络层(代理缺失/超时/DNS/TLS)与 auth 失败都要可见,
-      // 否则"连不上且无报错"导致反复排查(AGENTS.md §13:加日志落文件,关键字检索)
-      // err.code 覆盖 Node 网络错误(ETIMEDOUT/ENOTFOUND/ECONNREFUSED),err.name 覆盖 AbortError
-      const code = err?.code ?? err?.name ?? 'unknown';
-      const msg = (err?.message ?? String(err)).slice(0, 200);
+    } catch (err: unknown) {
+      // LIB-039：统一 eveLog（debugLog 落文件）；不再 console.error 双写刷屏
+      const e = err as { code?: string; name?: string; message?: string };
+      const code = e?.code ?? e?.name ?? 'unknown';
+      const msg = (e?.message ?? String(err)).slice(0, 200);
       eveLog(`probe failed host=${host} code=${code} msg=${msg}`);
-      console.error(`[eve] probe failed host=${host} code=${code} msg=${msg}`);
       return false;
     }
   }
@@ -138,17 +197,27 @@ export class EveagentBackend implements BackendAdapter {
     if (!session) throw new Error(`Session ${sessionId} not found`);
   }
 
-  async send(sessionId: string, content: string, opts?: { inputResponses?: InputResponse[] }): Promise<void> {
-    // 取消上一次未结束的 controller（防御性，正常 UI 不会在跑时再点发送）
+  // 排队执行 turn：send / respondInput 共用串行链，避免并发撞 continuationToken
+  private enqueueTurn(
+    sessionId: string,
+    content: string,
+    inputResponses?: InputResponse[],
+    runId?: string,
+  ): Promise<void> {
     const prev = this.turnChain.get(sessionId) ?? Promise.resolve();
     const controller = new AbortController();
     this.abortControllers.set(sessionId, controller);
-    // HITL 回答(inputResponses)透传到 runTurn → clientSession.send;eve 同 session 续接(durable)
-    const inputResponses = opts?.inputResponses;
-
     // host+auth 由 runTurn 从 db 读 service 行获取(sessions.targetId → eve_services),无需内存映射
-    const next = prev.then(() => this.runTurn(sessionId, content, controller.signal, inputResponses)).catch((err) => {
-      // abort 抛 AbortError 是预期路径，不打 ERROR 噪音
+    const next = prev.then(() => this.runTurn(sessionId, content, controller.signal, inputResponses, runId)).catch(async (err) => {
+      // clientSession.send 前失败也必须形成终态并释放锁，不能只记日志。
+      const event = err?.name === 'AbortError'
+        ? ({ type: 'abort' as const, reason: 'user_stop' })
+        : ({ type: 'error' as const, errorText: `${err?.name ?? 'unknown'}: ${err?.message ?? String(err)}` });
+      eventBus.emit(sessionId, event, runId);
+      await persistSessionEvent(sessionId, event, runId).catch((persistErr) => {
+        console.error(`[eveagent] dispatch failure persist sid=${sessionId}:`, persistErr);
+      });
+      await settleTurnLock(sessionId, runId);
       if (err?.name !== 'AbortError') {
         console.error(`[eveagent] turn error sid=${sessionId}:`, err);
       }
@@ -159,10 +228,83 @@ export class EveagentBackend implements BackendAdapter {
       }
     });
     this.turnChain.set(sessionId, next);
-    return next;
+    // BackendAdapter.send 的契约是“成功派发/入队即返回”，不能让 HTTP Route
+    // 等待整个远端 turn。运行期错误由上面的 catch + 终态事件路径收敛。
+    return Promise.resolve();
   }
 
-  private async runTurn(sessionId: string, content: string, signal: AbortSignal, inputResponses?: InputResponse[]): Promise<void> {
+  /**
+   * 用户消息 + 可选附件。
+   * eve 无本机路径：文本类嵌入正文；图片用 markdown data URL；其它二进制给 base64 说明。
+   */
+  async send(
+    sessionId: string,
+    content: string,
+    opts?: { attachments?: MessageAttachmentRef[]; runId?: string },
+  ): Promise<void> {
+    // D-006：中心分配 runId；进程内 eve 同样走 generation-stream
+    const { ulid } = await import('ulid');
+    const { generationStream } = await import('@/lib/events/generation-stream');
+    const { beginTurnIdle } = await import('@/lib/events/turn-idle-tracker');
+    const runId = opts?.runId ?? ulid();
+    generationStream.openRun(sessionId, runId);
+    beginTurnIdle(sessionId);
+    const message = await this.composeMessageWithAttachments(sessionId, content, opts?.attachments);
+    return this.enqueueTurn(sessionId, message, undefined, runId);
+  }
+
+  /**
+   * HITL 独立通道：空 message + inputResponses 续接 eve durable session
+   *（createHandleMessageBody 要求 inputResponses 配 continuationToken）
+   */
+  async respondInput(sessionId: string, responses: InputResponse[]): Promise<void> {
+    if (!responses.length) throw new Error('respondInput requires non-empty responses');
+    return this.enqueueTurn(sessionId, '', responses, await getTurnRunId(sessionId));
+  }
+
+  /** 把已上传附件并入 eve 可读的 message 字符串（云端 agent 无法读 webtool 本机路径） */
+  private async composeMessageWithAttachments(
+    sessionId: string,
+    content: string,
+    attachments?: MessageAttachmentRef[],
+  ): Promise<string> {
+    if (!attachments?.length) return content;
+    const blocks: string[] = [];
+    for (const ref of attachments) {
+      const buf = await readAttachmentBuffer(sessionId, ref.id);
+      if (!buf) {
+        blocks.push(`\n\n[附件缺失: ${ref.filename} id=${ref.id}]`);
+        continue;
+      }
+      const mt = ref.mediaType || 'application/octet-stream';
+      const name = ref.filename || buf.filename;
+      if (mt.startsWith('text/') || mt === 'application/json' || mt === 'application/javascript') {
+        // 文本直接嵌入，agent 无需二次拉取
+        const text = buf.data.toString('utf8');
+        blocks.push(`\n\n[附件: ${name} (${mt})]\n\`\`\`\n${text}\n\`\`\``);
+      } else if (mt.startsWith('image/')) {
+        const b64 = buf.data.toString('base64');
+        blocks.push(`\n\n[图片附件: ${name}]\n![${name}](data:${mt};base64,${b64})`);
+      } else {
+        // 其它二进制：给元数据 + base64，供 agent 解码/工具处理
+        const b64 = buf.data.toString('base64');
+        blocks.push(
+          `\n\n[二进制附件: ${name} (${mt}, ${buf.data.byteLength} bytes)]\n` +
+            `base64:\n${b64}`,
+        );
+      }
+    }
+    const body = content.trim() ? content : '（见附件）';
+    return body + blocks.join('');
+  }
+
+  private async runTurn(
+    sessionId: string,
+    content: string,
+    signal: AbortSignal,
+    inputResponses?: InputResponse[],
+    runId?: string,
+  ): Promise<void> {
     const db = await getDb();
     const history = await this.loadHistoryForContext(sessionId);
 
@@ -181,7 +323,7 @@ export class EveagentBackend implements BackendAdapter {
       .where(eq(sessions.id, sessionId)).limit(1);
     if (!row) throw new Error(`Session ${sessionId} not found`);
     if (!row.host || !row.targetId) throw new Error(`eve service not found: ${row.targetId ?? '(no target)'}`);
-    const client = this.getClient(row.targetId, row.host, row.authType ?? 'none', row.authConfig);
+    const client = this.getClient(row.targetId, row.host, asAuthType(row.authType), row.authConfig);
 
     // resume eve durable session:从 db 取上次 turn 持久化的 sessionId + continuationToken,
     // 喂给 client.session(state)。否则每次 client.session() 都新建会话,HITL 回答(inputResponses-only)
@@ -241,19 +383,19 @@ export class EveagentBackend implements BackendAdapter {
 
     // 消费 NDJSON 流 + 按结果分发(异常/abort/正常)。Single-use MessageResponse:iterate to consume
     // the stream and advance the client cursor. Loop exits on turn boundary or signal abort.
-    const { eventCount: finalCount, aborted, error } = await this.consumeStream(sessionId, response, signal, eventCountStart);
+    const { eventCount: finalCount, aborted, error } = await this.consumeStream(sessionId, response, signal, eventCountStart, runId);
     if (error && error.name !== 'AbortError' && !aborted) {
       // 非 abort 异常:emit+persist turn.completed(error) 解前端 isSending,再抛出(send.catch 吞)
-      await this.handleTurnError(sessionId, error, finalCount);
-      throw error;
+      await this.handleTurnError(sessionId, error, finalCount, runId);
+      return;
     }
     if (aborted) {
       // 主动停止:写 interrupted + emit turn.completed(interrupted) 让前端解开 isSending
-      await this.handleAbort(sessionId, finalCount);
+      await this.handleAbort(sessionId, finalCount, runId);
       return;
     }
     // 正常结束
-    await this.finalizeTurn(sessionId, finalCount);
+    await this.finalizeTurn(sessionId, finalCount, runId);
   }
 
   // 消费 eve NDJSON 流:逐事件 mapEveEventToWebtoolEvent → emit + persist + streamIndex 推进。
@@ -264,6 +406,7 @@ export class EveagentBackend implements BackendAdapter {
     response: MessageResponse,
     signal: AbortSignal,
     eventCountStart: number,
+    runId?: string,
   ): Promise<{ eventCount: number; aborted: boolean; error: Error | null }> {
     const db = await getDb();
     let eventCount = eventCountStart;
@@ -287,7 +430,7 @@ export class EveagentBackend implements BackendAdapter {
         for (const we of webtoolEvents) {
           eveLog(`event mapped sid=${sessionId} eveType=${event?.type} -> webtoolType=${we.type}`);
           eventBus.emit(sessionId, we);
-          await persistSessionEvent(sessionId, we);
+          await persistSessionEvent(sessionId, we, runId);
           if (we.type === 'part.end') hasPartEnd = true;
         }
         // 每 part.end 更新 db streamIndex(折中粒度缩小崩溃窗口,对齐 template advanceBrowserSession;崩溃窗口靠 T-006 _pid 去重兜底)
@@ -306,36 +449,34 @@ export class EveagentBackend implements BackendAdapter {
     }
   }
 
-  // 非 abort 异常收尾:emit+persist turn.completed(error) 解前端 isSending + finalizeTurn
-  // (原 throw 被 send.catch 吞不写 turn.completed,前端 use-session-messages.ts 依赖 turn.completed 解开 → 卡死)
-  private async handleTurnError(sessionId: string, err: Error, eventCount: number): Promise<void> {
+  // 非 abort 异常收尾:emit+persist error chunk 解前端 isSending + finalizeTurn
+  private async handleTurnError(sessionId: string, err: Error, eventCount: number, runId?: string): Promise<void> {
     const errorEvent = {
-      type: 'turn.completed' as const,
-      finishReason: 'error' as const,
-      error: { code: err?.name ?? 'unknown', message: err?.message ?? String(err) },
+      type: 'error' as const,
+      errorText: `${err?.name ?? 'unknown'}: ${err?.message ?? String(err)}`,
     };
     eventBus.emit(sessionId, errorEvent);
-    await persistSessionEvent(sessionId, errorEvent);
-    await this.finalizeTurn(sessionId, eventCount);
+    await persistSessionEvent(sessionId, errorEvent, runId);
+    await this.finalizeTurn(sessionId, eventCount, runId);
     eveLog(`turn error completed sid=${sessionId} streamIndex=${eventCount}`);
   }
 
-  // 主动停止收尾:写最后一条 assistant interrupted + emit turn.completed(interrupted) + finalizeTurn
-  private async handleAbort(sessionId: string, eventCount: number): Promise<void> {
+  // 主动停止收尾:abort chunk + finalizeTurn
+  private async handleAbort(sessionId: string, eventCount: number, runId?: string): Promise<void> {
     await this.markInterrupted(sessionId);
-    eventBus.emit(sessionId, { type: 'turn.completed', finishReason: 'interrupted' });
-    await persistSessionEvent(sessionId, { type: 'turn.completed', finishReason: 'interrupted' });
-    await this.finalizeTurn(sessionId, eventCount);
+    const abortEvent = { type: 'abort' as const, reason: 'user_stop' };
+    eventBus.emit(sessionId, abortEvent);
+    await persistSessionEvent(sessionId, abortEvent, runId);
+    await this.finalizeTurn(sessionId, eventCount, runId);
   }
 
   // turn 收尾(正常/异常/abort 三路径共用,去重):写回最终 streamIndex + 清 pending
-  private async finalizeTurn(sessionId: string, eventCount: number): Promise<void> {
+  private async finalizeTurn(sessionId: string, eventCount: number, runId?: string): Promise<void> {
     const db = await getDb();
     await db.update(sessions).set({
       streamIndex: eventCount,
-      pendingUserMessage: null,
-      pendingUserMessageCreatedAt: null,
     }).where(eq(sessions.id, sessionId));
+    await settleTurnLock(sessionId, runId);
   }
 
   // 把 session 当前最后一条 assistant 消息标记为 interrupted finishReason
@@ -364,7 +505,32 @@ export class EveagentBackend implements BackendAdapter {
     // 清理工作交给 send 的 .finally 收尾；这里不立即 delete 以避免竞态
   }
 
-  onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId?: number) => void, sinceEventId?: number): () => void {
+  /**
+   * 释放 session 级运行时态（LIB-002）。
+   * 清理 turnChain / turnState / abortControllers / resuming；
+   * clients 按 serviceId 缓存有意保留；EventBus 缓冲一并 release。
+   * 在会话 DELETE 等路径调用。
+   */
+  releaseRuntime(sessionId: string): void {
+    // 若仍有进行中的 turn，先 abort 再清 Map
+    const controller = this.abortControllers.get(sessionId);
+    if (controller) {
+      try {
+        controller.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.abortControllers.delete(sessionId);
+    this.turnChain.delete(sessionId);
+    this.turnState.delete(sessionId);
+    this.resuming.delete(sessionId);
+    eventBus.release(sessionId);
+    eveLog(`releaseRuntime sid=${sessionId}`);
+  }
+
+  // LIB-015：eventId 始终由 EventBus 提供
+  onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId: number) => void, sinceEventId?: number): () => void {
     return eventBus.subscribe(sessionId, cb, sinceEventId);
   }
 
@@ -457,7 +623,7 @@ export class EveagentBackend implements BackendAdapter {
       eveLog(`resume skip sid=${sessionId} reason=no-service`);
       return;
     }
-    const client = this.getClient(sessRow.targetId, sessRow.host, sessRow.authType ?? 'none', sessRow.authConfig);
+    const client = this.getClient(sessRow.targetId, sessRow.host, asAuthType(sessRow.authType), sessRow.authConfig);
 
     const streamIndex = sessRow.streamIndex ?? 0;
     // sessionState 喂 client.session:eve client #streamAndAdvance 用 startIndex 覆盖 state.streamIndex 追回
@@ -484,18 +650,47 @@ export class EveagentBackend implements BackendAdapter {
         for (const we of webtoolEvents) {
           // _pid 幂等去重:part.* 事件,partId 已在 db parts 集合则跳过 persist
           // (防崩溃窗口重复追回已落库事件导致 parts 重复段 / text 重复累加)
-          if (we.type === 'part.start' || we.type === 'part.delta' || we.type === 'part.update' || we.type === 'part.end') {
-            if (existingPartIds.has(we.partId)) {
-              eveLog(`resume dedup sid=${sessionId} partId=${we.partId} type=${we.type} -> skip persist`);
+          // 兼容 legacy part.* 与 UIMessageChunk 去重
+          const partId =
+            'partId' in we && typeof (we as { partId?: string }).partId === 'string'
+              ? (we as { partId: string }).partId
+              : 'id' in we && typeof (we as { id?: string }).id === 'string'
+                ? (we as { id: string }).id
+                : 'toolCallId' in we && typeof (we as { toolCallId?: string }).toolCallId === 'string'
+                  ? (we as { toolCallId: string }).toolCallId
+                  : null;
+          if (
+            partId &&
+            (we.type === 'part.start' ||
+              we.type === 'part.delta' ||
+              we.type === 'part.update' ||
+              we.type === 'part.end' ||
+              we.type === 'text-start' ||
+              we.type === 'text-delta' ||
+              we.type === 'text-end' ||
+              we.type === 'reasoning-start' ||
+              we.type === 'reasoning-delta' ||
+              we.type === 'reasoning-end')
+          ) {
+            if (existingPartIds.has(partId) && (we.type === 'part.start' || we.type === 'text-start' || we.type === 'reasoning-start')) {
+              eveLog(`resume dedup sid=${sessionId} partId=${partId} type=${we.type} -> skip persist`);
               continue;
             }
           }
           eventBus.emit(sessionId, we);
           await persistSessionEvent(sessionId, we);
-          // 新 part.start 记入集合:防本 turn 后续 delta/update/end 重复 persist(同 partId)
-          if (we.type === 'part.start') existingPartIds.add(we.partId);
-          if (we.type === 'part.end') hasPartEnd = true;
-          if (we.type === 'turn.completed') isBoundary = true;
+          if (we.type === 'part.start' || we.type === 'text-start' || we.type === 'reasoning-start') {
+            if (partId) existingPartIds.add(partId);
+          }
+          if (we.type === 'part.end' || we.type === 'text-end' || we.type === 'reasoning-end') hasPartEnd = true;
+          if (
+            we.type === 'turn.completed' ||
+            we.type === 'finish' ||
+            we.type === 'abort' ||
+            we.type === 'error'
+          ) {
+            isBoundary = true;
+          }
         }
         // 每 part.end 更新 db streamIndex(对齐 T-003 推进语义,缩小再次崩溃窗口)
         if (hasPartEnd) {
@@ -519,7 +714,8 @@ export class EveagentBackend implements BackendAdapter {
 
   // 按 serviceId 缓存带 auth 的 Client(一个 eve 服务一个 Client 实例,auth 跟着 service 走)。
   // host 或 authKey(authType:authConfig)变更(PATCH 后)→ 下次调用重建 Client,自动生效新 auth,无需重启。
-  private getClient(serviceId: string, host: string, authType: string, authConfig: string | null): Client {
+  // LIB-017：authType 使用联合类型，调用方经 asAuthType 收窄
+  private getClient(serviceId: string, host: string, authType: AuthType, authConfig: string | null): Client {
     const authKey = `${authType}:${authConfig ?? ''}`;
     const cached = this.clients.get(serviceId);
     if (cached && cached.host === host && cached.authKey === authKey) {
@@ -542,89 +738,94 @@ export class EveagentBackend implements BackendAdapter {
   }
 
   private async loadHistoryForContext(sessionId: string): Promise<ChatMessage[]> {
-    const db = await getDb();
-    // 新 schema 无 content 列,从 parts 提取 text(降级点 #2:eve clientContext 仅需文本;完整 parts 传递见 05 后续 adapter 改造)
-    const rows = await db.select({ role: messages.role, parts: messages.parts })
-      .from(messages)
-      .where(eq(messages.sessionId, sessionId))
-      .orderBy(asc(messages.seq));
-    return rows
-      .filter((r) => r.role === 'user' || r.role === 'assistant')
-      .map((r) => ({ role: r.role as 'user' | 'assistant', content: extractTextFromParts(r.parts) }))
-      .filter((r) => r.content);
+    // APP-008：复用 history helper（parts→text 降级点 #2 集中在 lib/chat）
+    return loadConversationHistory(sessionId);
   }
 
   // eve 事件 → WebtoolEvent[](按 04-adapter-mapping.md eve 表 + 06 partId 规则)
   // 一个 eve 事件可能产多个 WebtoolEvent(actions.requested 遍历、message.appended 先 start 再 delta)
-  private mapEveEventToWebtoolEvent(eveEvent: any, sessionId: string): WebtoolEvent[] {
-    const st = this.turnState.get(sessionId) ?? { turnId: null as string | null, startedParts: new Set<string>(), turnEnded: false };
-    this.turnState.set(sessionId, st);
+  // LIB-006/011：入口 unknown + 窄化；分支仍集中于此（拆文件会破坏与 04 映射表对照）
+  private mapEveEventToWebtoolEvent(eveEvent: unknown, sessionId: string): WebtoolEvent[] {
+    // LIB-012：仅在缺失时写入 Map，避免每 event 重复 set 同一引用
+    let st = this.turnState.get(sessionId);
+    if (!st) {
+      st = { turnId: null, startedParts: new Set<string>(), turnEnded: false };
+      this.turnState.set(sessionId, st);
+    }
     const out: WebtoolEvent[] = [];
-    const t = eveEvent?.type;
-    const d = eveEvent?.data ?? {};
+    const { type: t, data: d = {} } = asEveEvent(eveEvent);
+    const activeTurn = () =>
+      (typeof d.turnId === 'string' ? d.turnId : null) ?? st!.turnId;
 
     // turn.started:记录 turnId,重置 turnEnded + startedParts(新 turn 重新分配 partId)
     if (t === 'turn.started') {
-      st.turnId = d.turnId ?? null;
+      st.turnId = typeof d.turnId === 'string' ? d.turnId : d.turnId != null ? String(d.turnId) : null;
       st.turnEnded = false;
       st.startedParts.clear();
       return out;
     }
 
-    // message.appended:text 增量;首次先 part.start(streaming),后续 part.delta
+    // message.appended:text 增量 → text-start / text-delta
     if (t === 'message.appended') {
       const delta = d.messageDelta ?? d.delta;
-      if (!delta) return out;
-      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:text`;
+      if (typeof delta !== 'string' || !delta) return out;
+      const partId = evePartId(activeTurn(), d.stepIndex, 'text');
       if (!st.startedParts.has(partId)) {
-        out.push({ type: 'part.start', partId, part: { type: 'text', text: '', state: 'streaming' } });
+        out.push({ type: 'text-start', id: partId });
         st.startedParts.add(partId);
       }
-      out.push({ type: 'part.delta', partId, field: 'text', delta });
+      out.push({ type: 'text-delta', id: partId, delta });
       return out;
     }
 
-    // message.completed:text part 结束(带最终 message 校正)
+    // message.completed:text-end
     if (t === 'message.completed') {
-      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:text`;
-      out.push({ type: 'part.end', partId, part: { type: 'text', text: d.message ?? '', state: 'done' } });
+      const partId = evePartId(activeTurn(), d.stepIndex, 'text');
+      out.push({ type: 'text-end', id: partId });
       return out;
     }
 
-    // reasoning.appended:reasoning 增量
+    // reasoning.appended → reasoning-start / reasoning-delta
     if (t === 'reasoning.appended') {
       const delta = d.reasoningDelta ?? d.delta;
-      if (!delta) return out;
-      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:reasoning`;
+      if (typeof delta !== 'string' || !delta) return out;
+      const partId = evePartId(activeTurn(), d.stepIndex, 'reasoning');
       if (!st.startedParts.has(partId)) {
-        out.push({ type: 'part.start', partId, part: { type: 'reasoning', text: '', state: 'streaming' } });
+        out.push({ type: 'reasoning-start', id: partId });
         st.startedParts.add(partId);
       }
-      out.push({ type: 'part.delta', partId, field: 'reasoning', delta });
+      out.push({ type: 'reasoning-delta', id: partId, delta });
       return out;
     }
 
-    // reasoning.completed:reasoning part 结束
+    // reasoning.completed → reasoning-end
     if (t === 'reasoning.completed') {
-      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:reasoning`;
-      out.push({ type: 'part.end', partId, part: { type: 'reasoning', text: d.reasoning ?? '', state: 'done' } });
+      const partId = evePartId(activeTurn(), d.stepIndex, 'reasoning');
+      out.push({ type: 'reasoning-end', id: partId });
       return out;
     }
 
     // actions.requested:遍历整个 actions[](修原只取 [0] 的 bug);eve input 一次性给全 → state=input-available
     if (t === 'actions.requested' && Array.isArray(d.actions)) {
       for (const call of d.actions) {
-        if (!call?.callId) continue;
+        if (!isRecord(call) || typeof call.callId !== 'string') continue;
         const partId = call.callId;
+        const toolName =
+          (typeof call.toolName === 'string' && call.toolName) ||
+          (typeof call.name === 'string' && call.name) ||
+          'unknown';
         out.push({
-          type: 'part.start', partId,
-          part: {
-            type: 'dynamic-tool',
-            toolName: call.toolName ?? call.name ?? 'unknown',
-            toolCallId: call.callId,
-            state: 'input-available',
-            input: call.input ?? {},
-          },
+          type: 'tool-input-start',
+          toolCallId: call.callId,
+          toolName,
+          dynamic: true,
+        });
+        out.push({
+          type: 'tool-input-available',
+          toolCallId: call.callId,
+          toolName,
+          input: call.input ?? {},
+          dynamic: true,
         });
         st.startedParts.add(partId);
       }
@@ -634,26 +835,28 @@ export class EveagentBackend implements BackendAdapter {
     // input.requested:HITL 问题(eve ask_question 或带 approval 的工具)。每个 request → dynamic-tool part
     // state=approval-requested,inputRequest 挂 toolMetadata.inputRequest(前端按 display 渲染卡片)
     // requestId(=action.callId)作 partId,与后续 action.result 的 callId 一致,part.update 能定位
-    // 对齐 eve client message-reducer.ts:147-169 的投影
     if (t === 'input.requested' && Array.isArray(d.requests)) {
       for (const request of d.requests) {
-        if (!request?.requestId) continue;
+        if (!isRecord(request) || typeof request.requestId !== 'string') continue;
         const partId = request.requestId;
-        const action = request.action ?? {};
+        const action = isRecord(request.action) ? request.action : {};
+        const toolName =
+          (typeof action.toolName === 'string' && action.toolName) || 'ask_question';
+        const toolCallId =
+          (typeof action.callId === 'string' && action.callId) || request.requestId;
         out.push({
           type: 'part.start', partId,
           part: {
             type: 'dynamic-tool',
-            toolName: action.toolName ?? 'ask_question',
-            toolCallId: action.callId ?? request.requestId,
+            toolName,
+            toolCallId,
             state: 'approval-requested',
             input: action.input ?? {},
-            // approval.id=requestId:对齐 eve client,使 ai-elements Confirmation 也可关联
             approval: { id: request.requestId },
             toolMetadata: {
               inputRequest: toMessageInputRequest(request),
-              kind: action.kind ?? 'tool-call',
-              name: action.toolName ?? 'ask_question',
+              kind: (typeof action.kind === 'string' && action.kind) || 'tool-call',
+              name: toolName,
             },
           },
         });
@@ -662,10 +865,10 @@ export class EveagentBackend implements BackendAdapter {
       return out;
     }
 
-    // action.result:更新 tool part state + output(completed→output-available / failed→output-error / rejected→output-denied)
+    // action.result:更新 tool part state + output
     if (t === 'action.result') {
-      const r = d.result ?? {};
-      const partId = r.callId;
+      const r = isRecord(d.result) ? d.result : {};
+      const partId = typeof r.callId === 'string' ? r.callId : undefined;
       if (!partId) return out;
       const status = d.status;
       const patch: Record<string, unknown> = {
@@ -677,50 +880,51 @@ export class EveagentBackend implements BackendAdapter {
       return out;
     }
 
-    // step.completed:token/成本(usage 嵌套在 d.usage:costUsd/inputTokens/outputTokens/cacheReadTokens)。
-    // 不写 finishReason 到 metadata——那是 turn 级边界标志(只由 turn.completed 写),
-    // 否则 tool-loop 中间 step 的 finishReason='tool-calls' 会让 persist.getOrCreateCurrentAssistant
-    // 误判 turn 已结束,把同一 turn 的后续 step 拆到新 assistant 消息(破坏一 turn 一 assistant 语义)。
+    // step.completed:token/成本(usage 嵌套在 d.usage)。不写 finishReason（turn 边界专用）
     if (t === 'step.completed') {
       const meta: Partial<WebtoolMessageMetadata> = {};
-      if (d.usage) {
+      if (isRecord(d.usage)) {
+        const u = d.usage;
         meta.usage = {
-          inputTokens: d.usage.inputTokens,
-          outputTokens: d.usage.outputTokens,
-          // eve 字段名是 cacheReadTokens,映射到 WebtoolMessageMetadata.usage.cachedInputTokens
-          cachedInputTokens: d.usage.cacheReadTokens,
+          inputTokens: typeof u.inputTokens === 'number' ? u.inputTokens : undefined,
+          outputTokens: typeof u.outputTokens === 'number' ? u.outputTokens : undefined,
+          cachedInputTokens: typeof u.cacheReadTokens === 'number' ? u.cacheReadTokens : undefined,
         };
-        // cost 也在 d.usage 里(非顶层 d.costUsd)
-        if (d.usage.costUsd != null) meta.cost = d.usage.costUsd;
+        if (typeof u.costUsd === 'number') meta.cost = u.costUsd;
       }
-      if (Object.keys(meta).length > 0) out.push({ type: 'message.metadata', metadata: meta });
+      if (meta.usage || meta.cost != null) out.push({ type: 'message.metadata', metadata: meta });
       return out;
     }
 
     // session.started:提取 modelId(runtime identity)
     if (t === 'session.started') {
-      if (d.runtime?.modelId) out.push({ type: 'message.metadata', metadata: { modelId: d.runtime.modelId } });
+      const runtime = isRecord(d.runtime) ? d.runtime : undefined;
+      if (runtime && typeof runtime.modelId === 'string') {
+        out.push({ type: 'message.metadata', metadata: { modelId: runtime.modelId } });
+      }
       return out;
     }
 
-    // subagent.event:子 agent 流式事件(data.event 是嵌套 HandleMessageStreamEvent,见 eve protocol/message.ts:253-260)
-    // 不直接递归 mapEveEventToWebtoolEvent——子事件的 turnState(turn.started 重置 startedParts)/turn.completed
-    // 会污染父 turn(重复结束父 assistant 消息)。改为按子事件类型映射,partId 加 sub: 前缀隔离避免与父 part 冲突
-    if (t === 'subagent.event' && d.event) {
+    // subagent.event:不递归 map（避免污染父 turnState）；partId 加 sub: 前缀隔离
+    if (t === 'subagent.event' && isRecord(d.event)) {
       const sub = d.event;
-      const subType = sub.type;
+      const subType = typeof sub.type === 'string' ? sub.type : undefined;
+      const subData = isRecord(sub.data) ? sub.data : {};
       const subCallId = d.callId;
-      const subName = d.subagentName ?? 'subagent';
-      // 子事件含工具调用 → dynamic-tool part(对齐父 actions.requested 投影)
-      if (subType === 'actions.requested' && Array.isArray(sub.data?.actions)) {
-        for (const action of sub.data.actions) {
-          if (!action?.callId) continue;
-          const partId = `sub:${subCallId}:${action.callId}`;
+      const subName = typeof d.subagentName === 'string' ? d.subagentName : 'subagent';
+      if (subType === 'actions.requested' && Array.isArray(subData.actions)) {
+        for (const action of subData.actions) {
+          if (!isRecord(action) || typeof action.callId !== 'string') continue;
+          const partId = `sub:${String(subCallId ?? 'x')}:${action.callId}`;
+          const toolName =
+            (typeof action.toolName === 'string' && action.toolName) ||
+            (typeof action.name === 'string' && action.name) ||
+            `subagent:${subName}`;
           out.push({
             type: 'part.start', partId,
             part: {
               type: 'dynamic-tool',
-              toolName: action.toolName ?? action.name ?? `subagent:${subName}`,
+              toolName,
               toolCallId: action.callId,
               state: 'input-available',
               input: action.input ?? {},
@@ -730,35 +934,36 @@ export class EveagentBackend implements BackendAdapter {
         }
         return out;
       }
-      // 子事件 text/reasoning 增量或完成 → reasoning part(累积子 agent 推理/文本,标记子 agent 活动)
-      if (typeof subType === 'string' && (subType.startsWith('message.') || subType.startsWith('reasoning.'))) {
-        const partId = `sub:${subCallId}:reasoning`;
-        // 子事件完成 → 结束 reasoning part
+      if (subType && (subType.startsWith('message.') || subType.startsWith('reasoning.'))) {
+        const partId = `sub:${String(subCallId ?? 'x')}:reasoning`;
         if (subType.endsWith('.completed')) {
           if (st.startedParts.has(partId)) {
             out.push({ type: 'part.end', partId, part: { type: 'reasoning', text: '', state: 'done' } });
           }
           return out;
         }
-        // 子事件增量 → part.delta(首次先 part.start 带子 agent 名前缀)
-        const delta = sub.data?.messageDelta ?? sub.data?.reasoningDelta ?? '';
+        const deltaRaw = subData.messageDelta ?? subData.reasoningDelta ?? '';
+        const delta = typeof deltaRaw === 'string' ? deltaRaw : '';
         if (delta) {
           if (!st.startedParts.has(partId)) {
-            out.push({ type: 'part.start', partId, part: { type: 'reasoning', text: `[子 agent ${subName}]\n`, state: 'streaming' } });
+            out.push({
+              type: 'part.start',
+              partId,
+              part: { type: 'reasoning', text: `[子 agent ${subName}]\n`, state: 'streaming' },
+            });
             st.startedParts.add(partId);
           }
           out.push({ type: 'part.delta', partId, field: 'reasoning', delta });
         }
         return out;
       }
-      // 子边界事件(turn.*/session.*/step.*)不映射,避免重复 turn.completed 结束父 turn
       return out;
     }
 
-    // compaction.requested/completed:上下文压缩提示(eve reducer 不投影,webtool 加 reasoning 折叠提示让用户感知)
-    // 一 turn 一个 compaction reasoning part(turnId:compaction),startedParts 去重
+    // compaction：一 turn 一个 reasoning 提示
     if (t === 'compaction.requested' || t === 'compaction.completed') {
-      const partId = `${d.turnId ?? st.turnId}:compaction`;
+      const turn = activeTurn() ?? 'unknown';
+      const partId = `${turn}:compaction`;
       if (!st.startedParts.has(partId)) {
         out.push({ type: 'part.start', partId, part: { type: 'reasoning', text: '上下文已压缩', state: 'done' } });
         st.startedParts.add(partId);
@@ -766,29 +971,29 @@ export class EveagentBackend implements BackendAdapter {
       return out;
     }
 
-    // authorization.required:权限授权请求(eve 用 authorization part,webtool 统一用 dynamic-tool+approval 对齐 input.requested 语义)
-    // partId=${turnId}:${stepIndex}:auth:${name},对齐 eve partKey(authorization:turnId:stepIndex:name,见 message-reducer.ts:508)
+    // authorization.required → dynamic-tool + approval
     if (t === 'authorization.required') {
-      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:auth:${d.name}`;
+      const name = typeof d.name === 'string' ? d.name : 'auth';
+      const partId = evePartId(activeTurn(), d.stepIndex, 'auth', name);
       out.push({
         type: 'part.start', partId,
         part: {
           type: 'dynamic-tool',
-          toolName: `auth:${d.name}`,
+          toolName: `auth:${name}`,
           toolCallId: partId,
           state: 'approval-requested',
-          input: { description: d.description, name: d.name },
+          input: { description: d.description, name },
           approval: { id: partId },
-          toolMetadata: { kind: 'authorization', name: d.name },
+          toolMetadata: { kind: 'authorization', name },
         },
       });
       st.startedParts.add(partId);
       return out;
     }
 
-    // authorization.completed:授权结果(authorized→output-available / declined/failed/timed-out→output-denied)
     if (t === 'authorization.completed') {
-      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex}:auth:${d.name}`;
+      const name = typeof d.name === 'string' ? d.name : 'auth';
+      const partId = evePartId(activeTurn(), d.stepIndex, 'auth', name);
       const outcome = d.outcome;
       out.push({
         type: 'part.update', partId,
@@ -801,34 +1006,46 @@ export class EveagentBackend implements BackendAdapter {
       return out;
     }
 
-    // result.completed:结构化输出(eve reducer 投影到 metadata.result,见 message-reducer.ts:263-264;
-    // webtool WebtoolMessageMetadata 无 result 字段且不改 events.ts,映射为 text part 显示最终结构化输出)
+    // result.completed → text part 展示结构化输出
     if (t === 'result.completed') {
-      const partId = `${d.turnId ?? st.turnId}:${d.stepIndex ?? 0}:result`;
+      const partId = evePartId(activeTurn(), d.stepIndex ?? 0, 'result');
       out.push({ type: 'part.start', partId, part: { type: 'text', text: '', state: 'streaming' } });
-      out.push({ type: 'part.end', partId, part: { type: 'text', text: JSON.stringify(d.result ?? ''), state: 'done' } });
+      out.push({
+        type: 'part.end',
+        partId,
+        part: { type: 'text', text: JSON.stringify(d.result ?? ''), state: 'done' },
+      });
       st.startedParts.add(partId);
       return out;
     }
 
-    // 边界事件:turn.completed/failed/session.waiting/completed/failed(去重,首个边界发 turn.completed)
-    const isBoundary = t === 'turn.completed' || t === 'turn.failed' || t === 'session.waiting' || t === 'session.completed' || t === 'session.failed';
+    // 边界事件:turn.completed/failed/session.waiting/completed/failed(去重)
+    const isBoundary =
+      t === 'turn.completed' ||
+      t === 'turn.failed' ||
+      t === 'session.waiting' ||
+      t === 'session.completed' ||
+      t === 'session.failed';
     if (isBoundary) {
       if (!st.turnEnded) {
         if (t === 'turn.failed' || t === 'session.failed') {
-          out.push({ type: 'turn.completed', finishReason: 'error', error: { code: t, message: d.message ?? t } });
+          const message =
+            typeof d.message === 'string' ? d.message : (t ?? 'error');
+          out.push({
+            type: 'error',
+            errorText: `${t ?? 'error'}: ${message}`,
+          });
         } else {
-          out.push({ type: 'turn.completed', finishReason: 'stop' });
+          out.push({ type: 'finish', finishReason: 'stop' });
         }
         st.turnEnded = true;
       }
-      // session.failed 表示会话死亡,追加 disconnected
       if (t === 'session.failed') {
         out.push({ type: 'session.disconnected', reason: 'restart' });
       }
       return out;
     }
 
-    return out; // step.started(无 UI 可见信息,stepIndex 已在后续事件 data 里)/message.received(D-005:user 消息由 POST /messages 落库为权威源,映射会重复)暂未映射
+    return out;
   }
 }

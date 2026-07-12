@@ -4,6 +4,11 @@
 
 export type AuthType = 'none' | 'bearer' | 'headers';
 
+/** LIB-017：将未知字符串收窄为 AuthType（非 bearer/headers 一律 none） */
+export function asAuthType(value: unknown): AuthType {
+  return value === 'bearer' || value === 'headers' ? value : 'none';
+}
+
 // 解析 authConfig(JSON 字符串或对象)→ 结构化形态(token/headers);空/损坏 → null
 // validateAuth/eveagent.buildClientOptions/编辑回显共用,消除 JSON.parse + authType 分支重复
 // 空字符串 token 归 undefined(统一"空 token 视为无效"语义)
@@ -30,7 +35,7 @@ export function validateAuth(
   authConfig: unknown,
 ): { ok: true; authType: AuthType; authConfig: string | null } | { ok: false; error: string } {
   // authType 校验:非 bearer/headers 一律归 none
-  const t: AuthType = authType === 'bearer' || authType === 'headers' ? authType : 'none';
+  const t = asAuthType(authType);
   // none:authConfig 忽略,置 null
   if (t === 'none') return { ok: true, authType: 'none', authConfig: null };
   // bearer/headers:authConfig 必填

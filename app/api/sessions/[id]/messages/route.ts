@@ -3,8 +3,40 @@ import { getDb } from '@/lib/db/client';
 import { sessions, messages } from '@/lib/db/schema';
 import { eq, and, asc, desc, gt } from 'drizzle-orm';
 import { ulid } from 'ulid';
+import { getActiveSession } from '@/lib/api/get-active-session';
 import { getBackendAdapter } from '@/lib/backends/router';
 import { isPendingStale } from '@/lib/backends/pending';
+import type { MessageAttachmentRef } from '@/lib/backends/types';
+import {
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  publicUrlFor,
+  readAttachmentBuffer,
+} from '@/lib/attachments/store';
+import { debugLog } from '@/lib/debug-log';
+import { z } from 'zod';
+import { parseJsonBody } from '@/lib/api/parse-json-body';
+import { beginTurnMaterialize } from '@/lib/backends/persist';
+import { TurnBusyError, withTurnLock, releaseTurnLock } from '@/lib/backends/turn-lock';
+import { mimeFromFilename } from '@/lib/mime';
+
+// APP-004：messages POST body Zod 校验
+const messagePostSchema = z.object({
+  content: z.string().optional(),
+  attachments: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        filename: z.string().min(1),
+        mediaType: z.string().optional(),
+        size: z.number().optional(),
+        url: z.string().optional(),
+      }),
+    )
+    .optional(),
+}).refine(
+  (b) => (typeof b.content === 'string' && b.content.trim().length > 0) || (b.attachments?.length ?? 0) > 0,
+  { message: 'content or attachments required' },
+);
 
 export async function GET(
   request: NextRequest,
@@ -41,6 +73,7 @@ export async function GET(
         pendingUserMessage: null,
         pendingUserMessageCreatedAt: null,
       }).where(eq(sessions.id, id));
+      await releaseTurnLock(id);
     }
   }
 
@@ -53,53 +86,145 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const body = await request.json();
-  const { content } = body;
+  const parsed = await parseJsonBody(request, messagePostSchema);
+  if (!parsed.ok) return parsed.response;
 
-  if (!content) {
-    return NextResponse.json({ error: 'content is required' }, { status: 400 });
+  const text = typeof parsed.data.content === 'string' ? parsed.data.content : '';
+  const attachments = parsed.data.attachments ?? [];
+
+  if (attachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    return NextResponse.json(
+      { error: `at most ${MAX_ATTACHMENTS_PER_MESSAGE} attachments` },
+      { status: 400 },
+    );
   }
 
-  const db = await getDb();
-  const [session] = await db.select().from(sessions).where(eq(sessions.id, id)).limit(1);
+  // 校验附件已落盘，补全 url
+  const resolved: MessageAttachmentRef[] = [];
+  for (const a of attachments) {
+    const buf = await readAttachmentBuffer(id, a.id);
+    if (!buf) {
+      return NextResponse.json({ error: `attachment not found: ${a.id}` }, { status: 400 });
+    }
+    resolved.push({
+      id: a.id,
+      // 文件元数据以服务端落盘结果为准，禁止客户端伪造 URL/MIME/size。
+      filename: buf.filename,
+      mediaType: mimeFromFilename(buf.filename),
+      size: buf.data.byteLength,
+      url: publicUrlFor(id, a.id),
+    });
+  }
+
+  // APP-001：未删除 session 才允许发消息
+  const session = await getActiveSession(id);
   if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
+  const db = await getDb();
 
-  // 插入 user 消息
-  const msgId = ulid();
-  const now = new Date();
-  const [lastMsg] = await db.select({ seq: messages.seq }).from(messages)
-    .where(eq(messages.sessionId, id))
-    .orderBy(desc(messages.seq))
-    .limit(1);
-  const nextSeq = lastMsg ? lastMsg.seq + 1 : 1;
-  await db.insert(messages).values({
-    id: msgId,
-    sessionId: id,
-    seq: nextSeq,
-    role: 'user',
-    // user 消息存 parts 单元素(与 assistant 形态统一,见 05-schema-design.md 约束#3)
-    parts: JSON.stringify([{ type: 'text', text: content }]),
-    createdAt: now,
-  });
-
-  // 维护 session：首条 user 消息自动写入 title（仅当 title 与 userTitle 都为空），
-  // 并把 lastActiveAt 推到 now，让历史列表排序反映最近活跃。
-  // pendingUserMessage 标记"已提交但 turn 未完成":覆盖浏览器离开后 reload 的发送恢复(D-002)
-  const updates: Record<string, unknown> = {
-    lastActiveAt: now,
-    pendingUserMessage: content,
-    pendingUserMessageCreatedAt: now,
-  };
-  if (session.title === null && session.userTitle === null) {
-    updates.title = content.length > 30 ? content.slice(0, 30) : content;
+  // 组装 user parts：text + file（AI SDK FileUIPart 形态）
+  const parts: Array<Record<string, unknown>> = [];
+  if (text.trim()) {
+    parts.push({ type: 'text', text });
   }
-  await db.update(sessions).set(updates).where(eq(sessions.id, id));
+  for (const a of resolved) {
+    parts.push({
+      type: 'file',
+      filename: a.filename,
+      mediaType: a.mediaType,
+      url: a.url,
+    });
+  }
+  // 仅附件时仍保证有可读文本 part，方便历史列表标题
+  if (!text.trim() && resolved.length > 0) {
+    parts.unshift({
+      type: 'text',
+      text: resolved.map((a) => `[附件] ${a.filename}`).join('\n'),
+    });
+  }
 
-  // 通过 backend adapter 发送消息
+  const displayContent =
+    text.trim() ||
+    (resolved.length > 0 ? resolved.map((a) => a.filename).join(', ') : '');
+
+  // 数据库级 target 锁 + user 消息 + pending 在同一 BEGIN IMMEDIATE 事务内完成。
+  const msgId = ulid();
+  const runId = ulid();
+  const now = new Date();
+  try {
+    await withTurnLock({
+      backend: session.backend,
+      targetId: session.targetId,
+      sessionId: id,
+      runId,
+      acquiredAt: now,
+    }, async (tx) => {
+      const [last] = await tx.select({ seq: messages.seq }).from(messages)
+        .where(eq(messages.sessionId, id))
+        .orderBy(desc(messages.seq))
+        .limit(1);
+      const nextSeq = (last?.seq ?? 0) + 1;
+      await tx.insert(messages).values({
+        id: msgId,
+        sessionId: id,
+        seq: nextSeq,
+        role: 'user',
+        parts: JSON.stringify(parts),
+        createdAt: now,
+      });
+      const updates: Record<string, unknown> = {
+        lastActiveAt: now,
+        pendingUserMessage: displayContent,
+        pendingUserMessageCreatedAt: now,
+      };
+      if (session.title === null && session.userTitle === null) {
+        updates.title = displayContent.length > 30 ? displayContent.slice(0, 30) : displayContent;
+      }
+      await tx.update(sessions).set(updates).where(eq(sessions.id, id));
+      debugLog('app', `user message insert ok sid=${id} seq=${nextSeq} id=${msgId}`);
+    });
+  } catch (err) {
+    if (err instanceof TurnBusyError) {
+      return NextResponse.json({
+        error: err.conflictingSessionId === id ? 'turn_in_progress' : 'target_busy',
+        message: err.conflictingSessionId === id
+          ? '当前会话已有进行中的回复，请等待完成或停止后再发送'
+          : '该执行端已有其他会话的进行中 turn，请稍后再试',
+        conflictingSessionId: err.conflictingSessionId,
+      }, { status: 409 });
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    debugLog('app', `user message insert failed sid=${id} err=${msg}`);
+    return NextResponse.json(
+      { error: 'failed to allocate message seq', detail: msg },
+      { status: 500 },
+    );
+  }
+
+  // 通过 backend adapter 发送（含附件引用）
   const adapter = getBackendAdapter(session.backend);
-  adapter.send(id, content).catch(console.error);
+  // 新一轮物化：丢弃上一 turn 的 settled 快照，避免与迟到 chunk 交错
+  beginTurnMaterialize(id, runId);
+  // agent 侧 content：用户原文；仅附件时用简短占位，各 adapter 会再注入附件
+  const agentContent = text.trim() || (resolved.length > 0 ? '请查看附件' : '');
+  try {
+    await adapter.send(id, agentContent, {
+      ...(resolved.length ? { attachments: resolved } : {}),
+      runId,
+    });
+  } catch (err) {
+    await db.update(sessions).set({
+      pendingUserMessage: null,
+      pendingUserMessageCreatedAt: null,
+    }).where(eq(sessions.id, id));
+    await releaseTurnLock(id, runId);
+    const detail = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ error: 'send_failed', detail }, { status: 503 });
+  }
 
-  return NextResponse.json({ id: msgId, role: 'user', content }, { status: 201 });
+  return NextResponse.json(
+    { id: msgId, role: 'user', content: displayContent, attachments: resolved },
+    { status: 201 },
+  );
 }

@@ -8,6 +8,7 @@
 //   - 'get'/'all'/'values'：用 stmt.raw() 拿到数组形式（proxy 用 row[columnIndex] 取值，
 //     必须是 positional rows，不能是对象行）
 //   - migrate 走自定义 callback：conn.exec(sql) 顺序跑每条迁移语句
+import path from 'path';
 import { connect, type Database } from '@tursodatabase/database';
 import { drizzle, type SqliteRemoteDatabase } from 'drizzle-orm/sqlite-proxy';
 import * as schema from './schema';
@@ -16,6 +17,8 @@ declare global {
   // 全局缓存避免 Next.js dev 模式下 HMR 反复建连
   var __dbConn: Database | undefined;
   var __db: SqliteRemoteDatabase<typeof schema> | undefined;
+  // sqlite-proxy 共用单连接；BEGIN 不能并发进入，事务必须在进程内串行。
+  var __dbTransactionTail: Promise<void> | undefined;
 }
 
 // 把 libSQL 时代的 URI 还原为 turso 期望的原生路径：
@@ -62,6 +65,40 @@ export async function getDb() {
   return global.__db;
 }
 
+type Db = Awaited<ReturnType<typeof getDb>>;
+export type DbTransaction = Parameters<Parameters<Db['transaction']>[0]>[0];
+
+/**
+ * 在共用连接上串行执行 BEGIN IMMEDIATE，避免并发请求互相触发
+ * "cannot start a transaction within a transaction"。
+ */
+export async function withImmediateTransaction<T>(
+  work: (tx: DbTransaction) => Promise<T>,
+): Promise<T> {
+  const previous = global.__dbTransactionTail ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  global.__dbTransactionTail = previous.then(() => gate);
+  await previous;
+  try {
+    const db = await getDb();
+    return await db.transaction(work, { behavior: 'immediate' });
+  } finally {
+    release();
+  }
+}
+
+/** LIB-009：migrations 目录可配置，默认 path.resolve(cwd, 'drizzle') */
+function resolveMigrationsFolder(): string {
+  // WEBTOOL_DRIZZLE_DIR 可覆盖；始终 resolve 成绝对路径
+  if (process.env.WEBTOOL_DRIZZLE_DIR) {
+    return path.resolve(process.env.WEBTOOL_DRIZZLE_DIR);
+  }
+  return path.resolve(process.cwd(), 'drizzle');
+}
+
 export async function migrate() {
   // 复用 getDb() 的全局连接 —— 这样 :memory: 测试库也能看到表（每个 :memory: 连接独立）
   const conn = global.__dbConn ?? await (async () => {
@@ -77,12 +114,23 @@ export async function migrate() {
         await conn.exec(q);
       }
     },
-    { migrationsFolder: './drizzle' },
+    { migrationsFolder: resolveMigrationsFolder() },
   );
 }
 
+/** LIB-010：关闭连接须 await，避免竞态 */
 export async function resetDb() {
-  if (global.__dbConn) global.__dbConn.close();
+  if (global.__dbConn) {
+    try {
+      const maybe = global.__dbConn.close() as void | Promise<void>;
+      if (maybe && typeof (maybe as Promise<void>).then === 'function') {
+        await maybe;
+      }
+    } catch {
+      /* 关闭失败仍清全局引用 */
+    }
+  }
   global.__dbConn = undefined;
   global.__db = undefined;
+  global.__dbTransactionTail = undefined;
 }

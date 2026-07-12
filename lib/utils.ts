@@ -11,7 +11,11 @@ export function cn(...inputs: ClassValue[]) {
 
 // 相对时间格式化:刚刚 / N 分钟前 / N 小时前 / N 天前 / 具体日期;null → '从未'
 // 接受 Date | string(JSON 序列化的 Date) | null,首页列表 + 设备页共用
-export function formatRelative(date: Date | string | null): string {
+// LIB-038：locale 可参数覆盖；默认读 WEBTOOL_LOCALE，再回落 zh-CN
+export function formatRelative(
+  date: Date | string | null,
+  locale?: string,
+): string {
   if (date === null) return '从未';
   const d = typeof date === 'string' ? new Date(date) : date;
   const diff = Date.now() - d.getTime();
@@ -22,5 +26,9 @@ export function formatRelative(date: Date | string | null): string {
   if (hour < 24) return `${hour} 小时前`;
   const day = Math.floor(hour / 24);
   if (day < 7) return `${day} 天前`;
-  return d.toLocaleDateString('zh-CN');
+  const loc =
+    locale ||
+    (typeof process !== 'undefined' ? process.env.WEBTOOL_LOCALE : undefined) ||
+    'zh-CN';
+  return d.toLocaleDateString(loc);
 }

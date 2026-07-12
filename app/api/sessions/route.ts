@@ -4,14 +4,21 @@ import { sessions, devices, eveServices, messages } from '@/lib/db/schema';
 import { ulid } from 'ulid';
 import { eq, and, isNull, like, or, desc, inArray, sql } from 'drizzle-orm';
 import { getBackendAdapter } from '@/lib/backends/router';
+import { parseJsonBody } from '@/lib/api/parse-json-body';
+import { z } from 'zod';
+
+// APP-004：创建会话 body 校验
+const createSessionSchema = z.object({
+  backend: z.string().min(1),
+  model: z.string().min(1),
+  targetId: z.string().min(1),
+  cwd: z.string().optional().nullable(),
+});
 
 export async function POST(request: NextRequest) {
-  const body = await request.json();
-  const { backend, model, targetId, cwd } = body;
-
-  if (!backend || !model || !targetId) {
-    return NextResponse.json({ error: 'backend, model, targetId are required' }, { status: 400 });
-  }
+  const parsed = await parseJsonBody(request, createSessionSchema);
+  if (!parsed.ok) return parsed.response;
+  const { backend, model, targetId, cwd } = parsed.data;
 
   // 用适配器校验 targetId:listTargets 拿该后端可用端点,确认 targetId 在其中且 online + 支持 model。
   // API 层不硬编码 backend 名,端点来源差异(设备表 vs eve 服务表)封在适配器内。
@@ -49,7 +56,7 @@ export async function POST(request: NextRequest) {
       lastActiveAt: now,
     });
     // 启动 session:适配器内部决定对接方式(local 派发 WS 到 client,eveagent 选 host 走 HTTP)
-    await adapter.startSession({ sessionId: id, model, targetId, history: [], cwd });
+    await adapter.startSession({ sessionId: id, model, targetId, history: [], cwd: cwd ?? undefined });
   } catch (err) {
     console.error(`[session-create] failed backend=${backend} targetId=${targetId}:`, err);
     await db.delete(sessions).where(eq(sessions.id, id)).catch(() => {});
@@ -74,7 +81,9 @@ export async function GET(request: NextRequest) {
   if (backend) conditions.push(eq(sessions.backend, backend));
   if (q) {
     const pattern = `%${q}%`;
-    conditions.push(or(like(sessions.title, pattern), like(sessions.userTitle, pattern))!);
+    // APP-020：显式检查 or() 结果，避免非空断言
+    const titleOrUser = or(like(sessions.title, pattern), like(sessions.userTitle, pattern));
+    if (titleOrUser) conditions.push(titleOrUser);
   }
 
   const sessionRows = await db.select().from(sessions)

@@ -324,7 +324,9 @@ async function materializeAuthorityChunk(
     }
 
     case 'text-end': {
-      const text = state.textBuf.get(chunk.id) ?? '';
+      const snapshot = (chunk.providerMetadata as { webtool?: { text?: unknown } } | undefined)
+        ?.webtool?.text;
+      const text = typeof snapshot === 'string' ? snapshot : (state.textBuf.get(chunk.id) ?? '');
       state.textBuf.delete(chunk.id);
       upsertTextPart(state, chunk.id, text, 'text');
       await ensureOpenAssistant(sessionId, state, state.preferredMessageId);
@@ -333,7 +335,9 @@ async function materializeAuthorityChunk(
     }
 
     case 'reasoning-end': {
-      const text = state.reasoningBuf.get(chunk.id) ?? '';
+      const snapshot = (chunk.providerMetadata as { webtool?: { text?: unknown } } | undefined)
+        ?.webtool?.text;
+      const text = typeof snapshot === 'string' ? snapshot : (state.reasoningBuf.get(chunk.id) ?? '');
       state.reasoningBuf.delete(chunk.id);
       upsertTextPart(state, chunk.id, text, 'reasoning');
       await ensureOpenAssistant(sessionId, state, state.preferredMessageId);

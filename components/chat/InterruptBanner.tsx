@@ -54,6 +54,11 @@ const BANNER_COPY: Record<
     description: '本地客户端可能已挂起，请检查后重试。',
     variant: 'destructive',
   },
+  adapter_error: {
+    title: '本地 Agent 运行失败',
+    description: '请运行 webtool-client doctor，检查模型网关凭证并查看 client 日志后重试。',
+    variant: 'destructive',
+  },
 };
 
 const BANNER_COPY_DEFAULT = {

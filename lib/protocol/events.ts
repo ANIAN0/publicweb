@@ -92,8 +92,10 @@ export type SessionLifecycleEvent =
         | 'resume_failed'
         | 'ws_error'
         | 'heartbeat_timeout'
+        | 'adapter_error'
         | 'getDb_failed'
         | 'close';
+      message?: string;
     }
   | {
       type: 'session.start';

@@ -1,17 +1,11 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import type { CSSProperties, ReactNode } from "react";
+import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
 
-// Geist 字体:正文用 Sans,代码用 Mono,变量挂到 --font-geist-sans / --font-geist-mono
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
+// 字体：不走 Google 在线下载（内网/墙下 next/font/google 会失败刷屏）。
+// 使用系统栈；CSS 变量与原先 --font-geist-* 同名，globals 无需改。
+// 若以后要品牌字体，放到 public/fonts 用 next/font/local，禁止再引 google。
 
 export const metadata: Metadata = {
   title: "通用 ChatUI",
@@ -19,24 +13,31 @@ export const metadata: Metadata = {
 };
 
 // 暗色模式:在 body 内容渲染前同步读取系统偏好,给 <html> 加 .dark class,避免暗色闪烁
-// 后续若加主题切换器,把用户选择写入 localStorage 并在此读取覆盖系统偏好即可
 const themeScript = `(function(){try{if(window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches)document.documentElement.classList.add('dark');}catch(e){}})()`;
+
+const fontVars = {
+  ["--font-geist-sans"]:
+    'ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+  ["--font-geist-mono"]:
+    'ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace',
+} as CSSProperties;
 
 export default function RootLayout({
   children,
 }: Readonly<{
-  children: React.ReactNode;
+  children: ReactNode;
 }>) {
   return (
     <html
       lang="zh-CN"
       suppressHydrationWarning
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      className="h-full antialiased"
+      style={fontVars}
     >
-      <body className="min-h-full bg-background text-foreground">
-        {/* 暗色跟随系统脚本:须在 children 渲染前同步执行 */}
+      <body className="min-h-full bg-background font-sans text-foreground">
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
         {children}
+        <Toaster />
       </body>
     </html>
   );

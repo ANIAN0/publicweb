@@ -40,10 +40,12 @@ export type ConversationEmptyStateProps = ComponentProps<"div"> & {
   icon?: React.ReactNode;
 };
 
+// 默认中文空态；会话页可覆写 title/description 并注入建议 prompt
+// PAGE-002：title/description 始终渲染；children 仅作补充（建议 chips），禁止子节点再写一遍标题
 export const ConversationEmptyState = ({
   className,
-  title = "No messages yet",
-  description = "Start a conversation to see messages here",
+  title = "开始对话",
+  description = "输入消息，或点下方建议快速开始",
   icon,
   children,
   ...props
@@ -55,17 +57,14 @@ export const ConversationEmptyState = ({
     )}
     {...props}
   >
-    {children ?? (
-      <>
-        {icon && <div className="text-muted-foreground">{icon}</div>}
-        <div className="space-y-1">
-          <h3 className="font-medium text-sm">{title}</h3>
-          {description && (
-            <p className="text-muted-foreground text-sm">{description}</p>
-          )}
-        </div>
-      </>
-    )}
+    {icon && <div className="text-muted-foreground">{icon}</div>}
+    <div className="space-y-1">
+      <h3 className="font-medium text-sm">{title}</h3>
+      {description && (
+        <p className="text-muted-foreground text-sm">{description}</p>
+      )}
+    </div>
+    {children}
   </div>
 );
 
@@ -81,22 +80,27 @@ export const ConversationScrollButton = ({
     scrollToBottom();
   }, [scrollToBottom]);
 
+  // 始终占位渲染，用 opacity/scale 过渡避免条件挂载突变（清单 10.7 滚动按钮 transition）
   return (
-    !isAtBottom && (
-      <Button
-        className={cn(
-          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full dark:bg-background dark:hover:bg-muted",
-          className
-        )}
-        onClick={handleScrollToBottom}
-        size="icon"
-        type="button"
-        variant="outline"
-        {...props}
-      >
-        <ArrowDownIcon className="size-4" />
-      </Button>
-    )
+    <Button
+      className={cn(
+        "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full dark:bg-background dark:hover:bg-muted",
+        "transition-all duration-200",
+        isAtBottom
+          ? "pointer-events-none scale-90 opacity-0"
+          : "pointer-events-auto scale-100 opacity-100",
+        className
+      )}
+      onClick={handleScrollToBottom}
+      size="icon"
+      type="button"
+      variant="outline"
+      aria-label="滚动到底部"
+      tabIndex={isAtBottom ? -1 : 0}
+      {...props}
+    >
+      <ArrowDownIcon className="size-4" />
+    </Button>
   );
 };
 

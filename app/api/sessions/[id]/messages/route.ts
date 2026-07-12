@@ -15,9 +15,11 @@ import {
 import { debugLog } from '@/lib/debug-log';
 import { z } from 'zod';
 import { parseJsonBody } from '@/lib/api/parse-json-body';
-import { beginTurnMaterialize } from '@/lib/backends/persist';
+import { beginTurnMaterialize, withAuthoritySnapshot } from '@/lib/backends/persist';
 import { TurnBusyError, withTurnLock, releaseTurnLock } from '@/lib/backends/turn-lock';
 import { mimeFromFilename } from '@/lib/mime';
+import { sessionEventBus } from '@/lib/events/session-bus';
+import { eventBus } from '@/lib/backends/event-bus';
 
 // APP-004：messages POST body Zod 校验
 const messagePostSchema = z.object({
@@ -43,42 +45,42 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const db = await getDb();
   const since = request.nextUrl.searchParams.get('since');
-
-  let query = db.select().from(messages)
-    .where(eq(messages.sessionId, id))
-    .orderBy(asc(messages.seq));
-
-  if (since) {
-    const sinceNum = parseInt(since, 10);
-    // 增量语义：返回 seq 大于 since 的全部消息（修复 REV-005-3：原先 eq 只返回恰好等于的一条）
-    query = db.select().from(messages)
-      .where(and(eq(messages.sessionId, id), gt(messages.seq, sinceNum)))
-      .orderBy(asc(messages.seq));
+  const activeSession = await getActiveSession(id);
+  if (!activeSession) {
+    return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
-
-  const msgs = await query;
-
-  // 查 pendingUserMessage + stale 隐藏(C-006):stale 时返回 null 并同步清 db 过期 pending
-  const [session] = await db.select({ pendingUserMessage: sessions.pendingUserMessage })
-    .from(sessions).where(eq(sessions.id, id)).limit(1);
-  let pendingUserMessage: string | null = session?.pendingUserMessage ?? null;
-  if (pendingUserMessage) {
-    const stale = await isPendingStale(id);
-    if (stale) {
+  // Capture synchronously immediately before queueing the snapshot. Earlier
+  // events are already in the authority queue; later events enqueue behind it.
+  const eventCursor = activeSession.backend === 'eveagent'
+    ? eventBus.getLastId(id)
+    : sessionEventBus.getLastId(id);
+  const payload = await withAuthoritySnapshot(id, async () => {
+    const db = await getDb();
+    let query = db.select().from(messages)
+      .where(eq(messages.sessionId, id))
+      .orderBy(asc(messages.seq));
+    if (since) {
+      const sinceNum = parseInt(since, 10);
+      query = db.select().from(messages)
+        .where(and(eq(messages.sessionId, id), gt(messages.seq, sinceNum)))
+        .orderBy(asc(messages.seq));
+    }
+    const msgs = await query;
+    const [session] = await db.select({ pendingUserMessage: sessions.pendingUserMessage })
+      .from(sessions).where(eq(sessions.id, id)).limit(1);
+    let pendingUserMessage: string | null = session?.pendingUserMessage ?? null;
+    if (pendingUserMessage && await isPendingStale(id)) {
       pendingUserMessage = null;
-      // 同步清 db 过期 pending(避免下次 GET 重复判断 + T-006 误触发 resume)
       await db.update(sessions).set({
         pendingUserMessage: null,
         pendingUserMessageCreatedAt: null,
       }).where(eq(sessions.id, id));
       await releaseTurnLock(id);
     }
-  }
-
-  // 返回结构从数组改为 {messages, pendingUserMessage}(T-007 前端适配)
-  return NextResponse.json({ messages: msgs, pendingUserMessage });
+    return { messages: msgs, pendingUserMessage, eventCursor };
+  });
+  return NextResponse.json(payload);
 }
 
 export async function POST(
@@ -224,7 +226,7 @@ export async function POST(
   }
 
   return NextResponse.json(
-    { id: msgId, role: 'user', content: displayContent, attachments: resolved },
+    { id: msgId, role: 'user', content: displayContent, attachments: resolved, runId },
     { status: 201 },
   );
 }

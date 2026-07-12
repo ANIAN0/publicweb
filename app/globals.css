@@ -101,3 +101,16 @@
 [data-streamdown="link-safety-modal"] > div {
   max-width: 24rem;
 }
+
+/* 尊重系统「减少动态效果」:骨架 pulse、滚动按钮过渡、hover 动画全部降为瞬切
+   （清单 10.5；不覆盖关键的 opacity 显隐语义，只压 duration） */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

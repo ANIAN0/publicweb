@@ -1,35 +1,30 @@
-// Tool 分组:连续 dynamic-tool 累积分组,摘要行按 toolCategory 分桶输出"Verb N things"
-// 对齐 eve-chat-template message.tsx:357-429,752-855 ToolGroup
+// Tool 分组:连续 dynamic-tool 累积分组 + TOOL_META 摘要 + 长 output 折叠
+// COMP-004：头部状态复用 ai-elements Tool/getStatusBadge，自研层只做分组与摘要（DRY）
 'use client';
 
 import { useState } from 'react';
-import { ChevronDownIcon, WrenchIcon } from 'lucide-react';
+import { ChevronDownIcon } from 'lucide-react';
 import type { DynamicToolUIPart } from 'ai';
 import { cn } from '@/lib/utils';
 import {
   Tool,
-  ToolHeader,
   ToolContent,
-  ToolInput,
-  ToolOutput,
+  getStatusBadge,
 } from '@/components/ai-elements/tool';
+import { CollapsibleTrigger } from '@/components/ui/collapsible';
 import { InputRequestActions } from './InputRequestCard';
+import { CollapsibleDetail } from './collapsible-detail';
 import type { InputResponse, PersistedPart } from '@/lib/protocol/events';
+import {
+  extractErrorMeta,
+  formatToolPayload,
+  humanizeToolName,
+  inferToolCategory,
+  toolIconFor,
+  toolInputHint,
+} from '@/lib/chat/tool-meta';
 
-// toolCategory 从 toolName 推断(对齐 template toolCategory 推断规则)
-// searched:grep/search/find/glob;read:read/cat/head/tail/view;wrote:write/edit/patch/append/create;ran:bash/run/exec
-function inferToolCategory(toolName: string): 'searched' | 'read' | 'wrote' | 'ran' | 'other' {
-  const n = toolName.toLowerCase();
-  if (/grep|search|find|glob/.test(n)) return 'searched';
-  if (/^read|^cat|^head|^tail|view/.test(n)) return 'read';
-  if (/write|edit|patch|append|create|mkdir|^rm$|^mv$/.test(n)) return 'wrote';
-  if (/bash|run|exec|^sh$/.test(n)) return 'ran';
-  return 'other';
-}
-
-// 按 toolCategory 分桶输出摘要行(对齐 template summarizeToolGroup)
-// searched→"Searched N things" / read→"Read N things" / wrote→"Wrote N things" / ran→"Ran N things"
-// 多桶用 · 连接;全 other 或有 other 混合 → "Used N tools"(兜底,对齐 template)
+// 按 toolCategory 分桶摘要（中文）
 function summarizeToolGroup(parts: PersistedPart[]): string {
   if (parts.length === 0) return '';
   const buckets = new Map<'searched' | 'read' | 'wrote' | 'ran', number>();
@@ -37,31 +32,26 @@ function summarizeToolGroup(parts: PersistedPart[]): string {
   for (const p of parts) {
     const name = (p as { toolName?: string }).toolName ?? '';
     const cat = inferToolCategory(name);
-    if (cat === 'other') {
-      otherCount += 1;
-    } else {
-      buckets.set(cat, (buckets.get(cat) ?? 0) + 1);
-    }
+    if (cat === 'other') otherCount += 1;
+    else buckets.set(cat, (buckets.get(cat) ?? 0) + 1);
   }
-  // 全 other 或有 other 混合 → "Used N tools"
   if (otherCount > 0 || buckets.size === 0) {
-    return `Used ${parts.length} ${parts.length === 1 ? 'tool' : 'tools'}`;
+    return `使用了 ${parts.length} 个工具`;
   }
   const verbs: Record<'searched' | 'read' | 'wrote' | 'ran', string> = {
-    searched: 'Searched',
-    read: 'Read',
-    wrote: 'Wrote',
-    ran: 'Ran',
+    searched: '搜索',
+    read: '读取',
+    wrote: '写入',
+    ran: '执行',
   };
   const segs: string[] = [];
   for (const key of ['searched', 'read', 'wrote', 'ran'] as const) {
     const n = buckets.get(key);
-    if (n) segs.push(`${verbs[key]} ${n} ${n === 1 ? 'thing' : 'things'}`);
+    if (n) segs.push(`${verbs[key]} ${n} 项`);
   }
   return segs.join(' · ');
 }
 
-// part 是否有可展开详情(input/output/errorText/inputRequest)
 function hasToolDetails(part: PersistedPart): boolean {
   const p = part as {
     input?: unknown;
@@ -77,7 +67,47 @@ function hasToolDetails(part: PersistedPart): boolean {
   );
 }
 
-// 单个 Tool 调用项:复用 Tool 折叠 + ToolContent 内 InputRequestActions(T-008)+ ToolInput/ToolOutput
+// 单工具 header：icon + 可读名 + input hint + status + errorMeta
+function ToolCallHeader({
+  toolName,
+  state,
+  input,
+  errorText,
+  output,
+}: {
+  toolName: string;
+  state: DynamicToolUIPart['state'];
+  input: unknown;
+  errorText?: string;
+  output?: unknown;
+}) {
+  const Icon = toolIconFor(toolName);
+  const title = humanizeToolName(toolName);
+  const hint = toolInputHint(toolName, input);
+  const errMeta = state === 'output-error' ? extractErrorMeta(errorText, output) : undefined;
+
+  return (
+    <CollapsibleTrigger className="flex w-full items-center justify-between gap-3 p-3 text-left">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
+        <Icon className="size-4 shrink-0 text-muted-foreground" />
+        <span className="shrink-0 font-medium text-sm">{title}</span>
+        {hint && (
+          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground" title={hint}>
+            {hint}
+          </span>
+        )}
+        {errMeta && (
+          <span className="shrink-0 rounded bg-destructive/10 px-1.5 py-0.5 font-mono text-[10px] text-destructive">
+            {errMeta}
+          </span>
+        )}
+        {getStatusBadge(state)}
+      </div>
+      <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
+    </CollapsibleTrigger>
+  );
+}
+
 function ToolCallItem({
   part,
   onRespond,
@@ -85,29 +115,53 @@ function ToolCallItem({
   part: PersistedPart;
   onRespond?: (r: InputResponse) => void;
 }) {
-  // part 是 dynamic-tool PersistedPart;断言为 DynamicToolUIPart + _pid 访问标准字段
-  const p = part as DynamicToolUIPart & { _pid?: string };
-  // eve toolMetadata 非标准字段,单独断言(inputRequest/inputResponse 由 eveagent.ts + respondInput 注入)
-  // toolMetadata 统一路径（去 eve 专用）：inputRequest/inputResponse 由 adapter 注入
-  const meta = (part as { toolMetadata?: { inputRequest?: unknown; inputResponse?: unknown } }).toolMetadata;
+  const p = part as DynamicToolUIPart & { _pid?: string; errorText?: string };
+  const meta = (part as { toolMetadata?: { inputRequest?: unknown; inputResponse?: unknown } })
+    .toolMetadata;
   const hasInputRequest = Boolean(meta?.inputRequest);
   const hasInputResponse = Boolean(meta?.inputResponse);
+  const inputText = formatToolPayload(p.input);
+  const outputText = p.errorText
+    ? String(p.errorText)
+    : formatToolPayload(p.output);
+
   return (
-    <Tool defaultOpen={hasInputRequest}>
-      <ToolHeader type="dynamic-tool" state={p.state} toolName={p.toolName} />
+    <Tool defaultOpen={hasInputRequest} className={cn(p.state === 'output-error' && 'border-destructive/40')}>
+      <ToolCallHeader
+        toolName={p.toolName}
+        state={p.state}
+        input={p.input}
+        errorText={p.errorText}
+        output={p.output}
+      />
       <ToolContent>
-        {/* HITL 问题嵌顶部(与 ToolInput/ToolOutput 同级,T-008 嵌入式) */}
         {hasInputRequest && onRespond && (
           <InputRequestActions part={part} onRespond={onRespond} canRespond={!hasInputResponse} />
         )}
-        <ToolInput input={p.input} />
-        <ToolOutput output={p.output} errorText={p.errorText} />
+        {inputText && (
+          <div className="space-y-1">
+            <h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+              参数
+            </h4>
+            <CollapsibleDetail text={inputText} />
+          </div>
+        )}
+        {outputText && (
+          <div className="space-y-1">
+            <h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+              {p.errorText ? '错误' : '结果'}
+            </h4>
+            <CollapsibleDetail
+              text={outputText}
+              className={p.errorText ? '[&_pre]:bg-destructive/10 [&_pre]:text-destructive' : undefined}
+            />
+          </div>
+        )}
       </ToolContent>
     </Tool>
   );
 }
 
-// ToolGroup:连续 dynamic-tool 分组,摘要行可展开/收起
 export function ToolGroup({
   parts,
   onRespond,
@@ -115,12 +169,29 @@ export function ToolGroup({
   parts: PersistedPart[];
   onRespond?: (r: InputResponse) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  // HITL 待答时默认展开分组
+  const hasPendingHitl = parts.some((part) => {
+    const p = part as DynamicToolUIPart & { toolMetadata?: { inputRequest?: unknown; inputResponse?: unknown } };
+    return p.state === 'approval-requested' && p.toolMetadata?.inputRequest && !p.toolMetadata?.inputResponse;
+  });
+  const [open, setOpen] = useState(hasPendingHitl || parts.length === 1);
   if (parts.length === 0) return null;
-  // canExpand:多 tool 时 some(hasToolDetails);单 tool 时 hasToolDetails(parts[0])(单 tool 有 details 也可展开)
+
   const canExpand =
     parts.length > 1 ? parts.some(hasToolDetails) : hasToolDetails(parts[0]);
   const summary = summarizeToolGroup(parts);
+  // 单工具且无分组必要：直接渲染一项，避免双层折叠
+  if (parts.length === 1) {
+    return (
+      <div className="mb-4">
+        <ToolCallItem part={parts[0]} onRespond={onRespond} />
+      </div>
+    );
+  }
+
+  // 组级首项 icon
+  const FirstIcon = toolIconFor((parts[0] as { toolName?: string }).toolName ?? '');
+
   return (
     <div className="mb-4">
       <button
@@ -132,12 +203,12 @@ export function ToolGroup({
           canExpand ? 'cursor-pointer hover:bg-muted/50' : 'cursor-default opacity-80'
         )}
       >
-        <WrenchIcon className="size-4 text-muted-foreground" />
-        <span className="font-medium">{summary}</span>
+        <FirstIcon className="size-4 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 truncate font-medium">{summary}</span>
         {canExpand && (
           <ChevronDownIcon
             className={cn(
-              'ml-auto size-4 text-muted-foreground transition-transform',
+              'ml-auto size-4 shrink-0 text-muted-foreground transition-transform',
               open && 'rotate-180'
             )}
           />

@@ -21,6 +21,17 @@ interface ExecutionTarget {
   meta?: Record<string, string>;
 }
 
+async function readJsonOrThrow(response: Response): Promise<unknown> {
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = body && typeof body === 'object' && 'error' in body
+      ? String((body as { error: unknown }).error)
+      : `HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return body;
+}
+
 // 步骤:后端 → 端点 → 模型。模型步按 target.models 数量决定是否显示(单模型自动跳过选择)。
 // 所有后端走同一条代码路径,差异在适配器返回的 target.models 数量,不按 backend 名分叉。
 const STEPS = [
@@ -51,27 +62,49 @@ export default function NewSession() {
   const currentIndex = STEPS.findIndex((s) => s.key === step);
   const selectedTarget = targets.find((t) => t.id === targetId);
 
-  // 拉后端列表(数据驱动,不硬编码 3 张卡片)
+  // APP-023：拉后端列表；AbortController 防卸载后 setState
   useEffect(() => {
-    fetch('/api/backends').then((r) => r.json()).then((b: BackendDescriptor[]) => setBackends(b));
+    const ac = new AbortController();
+    fetch('/api/backends', { signal: ac.signal })
+      .then(readJsonOrThrow)
+      .then((body) => {
+        if (!Array.isArray(body)) throw new Error('后端列表响应格式错误');
+        setBackends(body as BackendDescriptor[]);
+      })
+      .catch((err: unknown) => {
+        if (err instanceof Error && err.name === 'AbortError') return;
+        setError(err instanceof Error ? err.message : '加载后端失败');
+      });
+    return () => ac.abort();
   }, []);
 
   // 选后端后拉端点列表(适配器返回,local=设备,eveagent=eve 服务)
   useEffect(() => {
     if (step !== 'target' || !backend) return;
-    fetch(`/api/backends/${backend}/targets`).then((r) => r.json()).then((t: ExecutionTarget[]) => {
-      setTargets(t);
-      // 唯一在线端点:自动选中 + 同步选 model(单模型端点步直接可创建,多模型进模型步可改)
-      const onlineOnes = t.filter((x) => x.online);
-      if (onlineOnes.length === 1) {
-        const only = onlineOnes[0];
-        setTargetId(only.id);
-        if (only.models.length >= 1) {
-          const def = only.models.find((m) => m.isDefault) ?? only.models[0];
-          setModel(def.id);
+    const ac = new AbortController();
+    setTargets([]);
+    fetch(`/api/backends/${backend}/targets`, { signal: ac.signal })
+      .then(readJsonOrThrow)
+      .then((body) => {
+        if (!Array.isArray(body)) throw new Error('端点列表响应格式错误');
+        const t = body as ExecutionTarget[];
+        setTargets(t);
+        // 唯一在线端点:自动选中 + 同步选 model(单模型端点步直接可创建,多模型进模型步可改)
+        const onlineOnes = t.filter((x) => x.online);
+        if (onlineOnes.length === 1) {
+          const only = onlineOnes[0];
+          setTargetId(only.id);
+          if (only.models.length >= 1) {
+            const def = only.models.find((m) => m.isDefault) ?? only.models[0];
+            setModel(def.id);
+          }
         }
-      }
-    });
+      })
+      .catch((err: unknown) => {
+        if (err instanceof Error && err.name === 'AbortError') return;
+        setError(err instanceof Error ? err.message : '加载端点失败');
+      });
+    return () => ac.abort();
   }, [step, backend]);
 
   // 选端点:同步选 model(单模型自动选默认;多模型选默认作为初值,模型步可改)。
@@ -99,12 +132,15 @@ export default function NewSession() {
         body: JSON.stringify({ backend, targetId, model, cwd: cwd || undefined }),
       });
       if (res.ok) {
-        const data = await res.json();
+        const data = await res.json() as { id?: string };
+        if (!data.id) throw new Error('创建会话响应格式错误');
         router.push(`/sessions/${data.id}`);
       } else {
-        const err = await res.json();
-        setError(err.error ?? 'create failed');
+        const err = await res.json().catch(() => ({})) as { error?: string };
+        setError(err.error ?? `创建失败: HTTP ${res.status}`);
       }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '创建会话失败');
     } finally {
       setSubmitting(false);
     }

@@ -21,7 +21,9 @@ export const eventBus = {
   subscribe: core.subscribe.bind(core) as EventBusCore['subscribe'],
   release: core.release.bind(core) as EventBusCore['release'],
   sessionCount: core.sessionCount.bind(core) as EventBusCore['sessionCount'],
+  getLastId: core.getLastId.bind(core) as EventBusCore['getLastId'],
   emit(sessionId: string, event: WebtoolEvent, runIdHint?: string): number {
+    const effectiveRunId = runIdHint ?? generationStream.getActiveRunId(sessionId);
     try {
       generationStream.publish(sessionId, event, runIdHint);
     } catch (err) {
@@ -32,6 +34,6 @@ export const eventBus = {
     } catch {
       /* ignore */
     }
-    return core.emit(sessionId, event);
+    return core.emit(sessionId, event, effectiveRunId);
   },
 };

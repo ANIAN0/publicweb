@@ -530,7 +530,7 @@ export class EveagentBackend implements BackendAdapter {
   }
 
   // LIB-015：eventId 始终由 EventBus 提供
-  onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId: number) => void, sinceEventId?: number): () => void {
+  onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId: number, runId?: string) => void, sinceEventId?: number): () => void {
     return eventBus.subscribe(sessionId, cb, sinceEventId);
   }
 

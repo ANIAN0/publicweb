@@ -59,8 +59,10 @@ import type {
   FormEventHandler,
   HTMLAttributes,
   KeyboardEventHandler,
+  MutableRefObject,
   PropsWithChildren,
   ReactNode,
+  Ref,
   RefObject,
 } from "react";
 import {
@@ -414,6 +416,10 @@ export type PromptInputActionAddAttachmentsProps = ComponentProps<
   label?: string;
 };
 
+type DropdownMenuSelectEvent = Parameters<
+  NonNullable<ComponentProps<typeof DropdownMenuItem>["onSelect"]>
+>[0];
+
 export const PromptInputActionAddAttachments = ({
   label = "Add photos or files",
   ...props
@@ -421,7 +427,7 @@ export const PromptInputActionAddAttachments = ({
   const attachments = usePromptInputAttachments();
 
   const handleSelect = useCallback(
-    (e: Event) => {
+    (e: DropdownMenuSelectEvent) => {
       e.preventDefault();
       attachments.openFileDialog();
     },
@@ -449,7 +455,7 @@ export const PromptInputActionAddScreenshot = ({
   const attachments = usePromptInputAttachments();
 
   const handleSelect = useCallback(
-    async (event: Event) => {
+    async (event: DropdownMenuSelectEvent) => {
       onSelect?.(event);
       if (event.defaultPrevented) {
         return;
@@ -508,7 +514,7 @@ export type PromptInputProps = Omit<
   onSubmit: (
     message: PromptInputMessage,
     event: FormEvent<HTMLFormElement>
-  ) => void | Promise<void>;
+  ) => boolean | void | Promise<boolean | void>;
 };
 
 export const PromptInput = ({
@@ -875,21 +881,10 @@ export const PromptInput = ({
           })
         );
 
-        const result = onSubmit({ files: convertedFiles, text }, event);
+        const submitted = await onSubmit({ files: convertedFiles, text }, event);
 
-        // Handle both sync and async onSubmit
-        if (result instanceof Promise) {
-          try {
-            await result;
-            clear();
-            if (usingProvider) {
-              controller.textInput.clear();
-            }
-          } catch {
-            // Don't clear on error - user may want to retry
-          }
-        } else {
-          // Sync function completed without throwing, clear inputs
+        // `false` means the caller deliberately kept the draft for retry.
+        if (submitted !== false) {
           clear();
           if (usingProvider) {
             controller.textInput.clear();
@@ -959,16 +954,30 @@ export const PromptInputTextarea = ({
   className,
   placeholder = "What would you like to know?",
   autoFocus,  // T-012:ready 时 rAF focus
+  ref, // React 19：ref 作 prop；PAGE-001/COMP-011 用 ref 绑焦点，禁止 querySelector
   ...props
-}: PromptInputTextareaProps & { autoFocus?: boolean }) => {
+}: PromptInputTextareaProps & {
+  autoFocus?: boolean;
+  ref?: Ref<HTMLTextAreaElement>;
+}) => {
   const controller = useOptionalPromptInputController();
   const attachments = usePromptInputAttachments();
   const [isComposing, setIsComposing] = useState(false);
-  // T-012:ready 时 rAF focus textarea(对齐 template,autoFocus prop 控制)
+  // 内部 ref：autoFocus 与外部 ref 合并
+  const localRef = useRef<HTMLTextAreaElement | null>(null);
+  const setTextareaRef = useCallback(
+    (node: HTMLTextAreaElement | null) => {
+      localRef.current = node;
+      if (typeof ref === "function") ref(node);
+      else if (ref) (ref as MutableRefObject<HTMLTextAreaElement | null>).current = node;
+    },
+    [ref],
+  );
+  // T-012:ready 时 rAF focus 本组件 textarea（对齐 template；COMP-011 不用全局 querySelector）
   useEffect(() => {
     if (autoFocus) {
       const id = requestAnimationFrame(() => {
-        document.querySelector<HTMLTextAreaElement>("textarea")?.focus();
+        localRef.current?.focus();
       });
       return () => cancelAnimationFrame(id);
     }
@@ -1065,6 +1074,7 @@ export const PromptInputTextarea = ({
 
   return (
     <InputGroupTextarea
+      ref={setTextareaRef}
       className={cn("field-sizing-content max-h-48 min-h-16", className)}
       name="message"
       onCompositionEnd={handleCompositionEnd}
@@ -1172,7 +1182,8 @@ export const PromptInputButton = ({
 
   return (
     <Tooltip>
-      <TooltipTrigger>{button}</TooltipTrigger>
+      {/* Base UI：render 合并触发元素，避免 button 嵌套 button / hydration 失败 */}
+      <TooltipTrigger render={button} />
       <TooltipContent side={side}>
         {tooltipContent}
         {shortcut && (
@@ -1250,8 +1261,12 @@ export const PromptInputSubmit = ({
     Icon = <XIcon className="size-4" />;
   }
 
+  type SubmitClickEvent = Parameters<
+    NonNullable<ComponentProps<typeof InputGroupButton>["onClick"]>
+  >[0];
+
   const handleClick = useCallback(
-    (e: React.MouseEvent<HTMLButtonElement>) => {
+    (e: SubmitClickEvent) => {
       if (isGenerating && onStop) {
         e.preventDefault();
         onStop();
@@ -1333,12 +1348,8 @@ export const PromptInputSelectValue = ({
 
 export type PromptInputHoverCardProps = ComponentProps<typeof HoverCard>;
 
-export const PromptInputHoverCard = ({
-  openDelay = 0,
-  closeDelay = 0,
-  ...props
-}: PromptInputHoverCardProps) => (
-  <HoverCard closeDelay={closeDelay} openDelay={openDelay} {...props} />
+export const PromptInputHoverCard = (props: PromptInputHoverCardProps) => (
+  <HoverCard {...props} />
 );
 
 export type PromptInputHoverCardTriggerProps = ComponentProps<

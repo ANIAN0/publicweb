@@ -161,6 +161,7 @@ export async function POST(
 
   return NextResponse.json({
     ok: true,
+    runId,
     mode,
     userMessageId: userMsg.id,
     content: sendContent,

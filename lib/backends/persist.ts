@@ -806,7 +806,7 @@ function isUIMessageChunk(event: WebtoolEvent): event is UIMessageChunk {
  * 把一条 WebtoolEvent / UIMessageChunk 写入权威库（按白名单）。
  * 仅流 type 只更新内存缓冲，不写 messages。
  */
-export async function persistSessionEvent(
+async function persistSessionEventUnlocked(
   sessionId: string,
   event: WebtoolEvent,
   runId?: string,
@@ -816,7 +816,7 @@ export async function persistSessionEvent(
     if (isStreamContentEnvelope(event)) {
       const state = getTurnState(sessionId);
       state.runId = event.runId;
-      await persistSessionEvent(sessionId, event.chunk, event.runId);
+      await persistSessionEventUnlocked(sessionId, event.chunk, event.runId);
       return;
     }
 
@@ -851,6 +851,51 @@ export async function persistSessionEvent(
     console.error(`[persist] failed sessionId=${sessionId} event=${type}:`, err);
     throw err;
   }
+}
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __authorityPersistChains: Map<string, Promise<unknown>> | undefined;
+}
+
+function authorityPersistChains(): Map<string, Promise<unknown>> {
+  if (!global.__authorityPersistChains) global.__authorityPersistChains = new Map();
+  return global.__authorityPersistChains;
+}
+
+function enqueueAuthorityTask<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
+  const chains = authorityPersistChains();
+  const previous = chains.get(sessionId) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(task);
+  chains.set(sessionId, current);
+  const cleanup = () => {
+    if (chains.get(sessionId) === current) chains.delete(sessionId);
+  };
+  void current.then(cleanup, cleanup);
+  return current;
+}
+
+/** Serialize authority materialization per session. */
+export function persistSessionEvent(
+  sessionId: string,
+  event: WebtoolEvent,
+  runId?: string,
+): Promise<void> {
+  return enqueueAuthorityTask(sessionId, () =>
+    persistSessionEventUnlocked(sessionId, event, runId),
+  );
+}
+
+/**
+ * Run a database snapshot after every event already published for this session.
+ * Events published afterwards enqueue behind the snapshot, so the returned
+ * event cursor is an exact boundary for SSE replay.
+ */
+export function withAuthoritySnapshot<T>(
+  sessionId: string,
+  reader: () => Promise<T>,
+): Promise<T> {
+  return enqueueAuthorityTask(sessionId, reader);
 }
 
 // LIB-024：实现迁至 lib/chat/parts；此处 re-export 保持旧 import 兼容

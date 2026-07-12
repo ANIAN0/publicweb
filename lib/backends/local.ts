@@ -262,7 +262,7 @@ export class LocalBackend implements BackendAdapter {
    */
   onEvent(
     sessionId: string,
-    cb: (e: WebtoolEvent, eventId: number) => void,
+    cb: (e: WebtoolEvent, eventId: number, runId?: string) => void,
     sinceEventId?: number,
   ): () => void {
     // 转发缓冲回放；SSE 可带 Last-Event-ID

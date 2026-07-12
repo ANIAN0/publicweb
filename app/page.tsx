@@ -358,15 +358,17 @@ function SessionRow({
               <DropdownMenuItem onClick={() => setRenaming(true)}>
                 <Pencil className="size-4" /> 重命名
               </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              {/* 清理项:仅 targetDeleted=true 显示,清理已删 target 的历史会话（区别于"删除"操作） */}
+              {/* 清理项:仅 targetDeleted 时显示，并单独加分割线（避免双分割线） */}
               {item.targetDeleted && (
-                <DropdownMenuItem
-                  className="text-muted-foreground focus:bg-muted"
-                  onClick={() => setConfirmDelete(true)}
-                >
-                  <Eraser className="size-4" /> 清理
-                </DropdownMenuItem>
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    className="text-muted-foreground focus:bg-muted"
+                    onClick={() => setConfirmDelete(true)}
+                  >
+                    <Eraser className="size-4" /> 清理
+                  </DropdownMenuItem>
+                </>
               )}
               <DropdownMenuSeparator />
               {/* 删除项:红色文字 + hover 红底 */}

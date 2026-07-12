@@ -15,20 +15,26 @@ export async function GET(
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
 
-  // 读 ?since query(reload 续接)或 Last-Event-ID 头(EventSource 自动重连带),传给 onEvent 回放缓冲
-  const sinceEventIdRaw =
-    request.nextUrl.searchParams.get('since') ??
-    request.headers.get('Last-Event-ID');
+  const runIdParam = request.nextUrl.searchParams.get('runId') ?? undefined;
+  const lastEventId = request.headers.get('Last-Event-ID');
+
+  // session 级连接：Last-Event-ID 表示 session event id。
+  // run 级连接禁止把同一个值当 since，否则会混用两套游标。
+  const sinceEventIdRaw = runIdParam
+    ? null
+    : request.nextUrl.searchParams.get('since') ?? lastEventId;
   const sinceEventId =
     sinceEventIdRaw !== null && /^\d+$/.test(sinceEventIdRaw)
       ? Number(sinceEventIdRaw)
       : undefined;
 
-  // T-002b：run 级 afterSeq 回放（展示续接）；与 session 级 since 并存
-  const afterSeqRaw = request.nextUrl.searchParams.get('afterSeq');
+  // run 级连接：首次使用 URL afterSeq；EventSource 自动重连时优先使用
+  // 浏览器携带的 Last-Event-ID，避免固定 URL 重复回放旧 delta。
+  const afterSeqRaw = runIdParam
+    ? lastEventId ?? request.nextUrl.searchParams.get('afterSeq')
+    : request.nextUrl.searchParams.get('afterSeq');
   const afterSeq =
     afterSeqRaw !== null && /^\d+$/.test(afterSeqRaw) ? Number(afterSeqRaw) : undefined;
-  const runIdParam = request.nextUrl.searchParams.get('runId') ?? undefined;
   const activeRunId = runIdParam ?? generationStream.getActiveRunId(id);
 
   const encoder = new TextEncoder();
@@ -90,8 +96,8 @@ export async function GET(
           // 默认路径：session 级 bus（含 since 回放）
           const unsubscribe = adapter.onEvent(
             id,
-            (event, eventId) => {
-              const runId = generationStream.getActiveRunId(id);
+            (event, eventId, eventRunId) => {
+              const runId = eventRunId ?? generationStream.getActiveRunId(id);
               const idLine = eventId !== undefined ? `id: ${eventId}\n` : '';
               const payload =
                 runId != null

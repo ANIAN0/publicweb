@@ -1,5 +1,5 @@
 // 空状态:icon + 标题 + 描述 + 可选 CTA + 可选帮助链接
-// 三页(首页/设备/Eve 服务)统一结构,消除各页 empty 文案/结构不一致
+// LAYOUT-002：列表页用本组件；会话区用 ConversationEmptyState（对话语义不同，有意并存）
 import type { ReactNode } from 'react';
 
 export interface EmptyStateProps {

@@ -1,6 +1,6 @@
 // 错误横幅:页面级错误(拉列表失败/整体不可用)统一展示
+// LAYOUT-003：与 InterruptBanner 同用 Alert，但职责不同——列表/页级错误 vs 会话断连
 // 用 shadcn Alert destructive + 友好文案 + 重试按钮
-// 替代各页自写 destructive div + alert(),呼应清单 4.1/4.2/10.4
 import { AlertCircle, RefreshCw } from 'lucide-react';
 import { Alert, AlertTitle, AlertAction } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';

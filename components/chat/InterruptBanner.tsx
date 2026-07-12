@@ -24,20 +24,51 @@ export interface InterruptBannerProps {
   onDismiss?: () => void;
 }
 
-// reason → 文案：events.ts:45 的 union 三态
-// 历史上曾有 device-offline（连字符）不匹配 bug，已统一为下划线
-function bannerCopy(reason: string | undefined): { title: string; description: string; variant: 'destructive' | 'warning' } {
-  switch (reason) {
-    case 'device_offline':
-      // 设备离线属可恢复态(等待客户端重连),用 warning(琥珀);network/restart 属故障态,用 destructive(红)
-      return { title: '设备已断开', description: '等待本地客户端自动重连，或点击重试。', variant: 'warning' };
-    case 'restart':
-      return { title: '会话后端重启中', description: '正在恢复会话，请稍候。', variant: 'destructive' };
-    case 'network':
-      return { title: '网络中断', description: '请检查网络连接，或点击重试。', variant: 'destructive' };
-    default:
-      return { title: '连接已断开', description: '请点击重试恢复会话。', variant: 'destructive' };
-  }
+// COMP-007：文案集中表，避免散落硬编码；i18n 未接入前保持中文默认
+const BANNER_COPY: Record<
+  string,
+  { title: string; description: string; variant: 'destructive' | 'warning' }
+> = {
+  device_offline: {
+    title: '设备已断开',
+    description: '等待本地客户端自动重连，或点击重试。',
+    variant: 'warning',
+  },
+  restart: {
+    title: '会话后端重启中',
+    description: '正在恢复会话，请稍候。',
+    variant: 'destructive',
+  },
+  network: {
+    title: '网络中断',
+    description: '请检查网络连接，或点击重试。',
+    variant: 'destructive',
+  },
+  resume_failed: {
+    title: '会话恢复失败',
+    description: '自动续接未成功，请点击重试。',
+    variant: 'destructive',
+  },
+  heartbeat_timeout: {
+    title: '设备心跳超时',
+    description: '本地客户端可能已挂起，请检查后重试。',
+    variant: 'destructive',
+  },
+};
+
+const BANNER_COPY_DEFAULT = {
+  title: '连接已断开',
+  description: '请点击重试恢复会话。',
+  variant: 'destructive' as const,
+};
+
+function bannerCopy(reason: string | undefined): {
+  title: string;
+  description: string;
+  variant: 'destructive' | 'warning';
+} {
+  if (reason && BANNER_COPY[reason]) return BANNER_COPY[reason];
+  return BANNER_COPY_DEFAULT;
 }
 
 export function InterruptBanner({ open, reason, busy, onRetry, onDismiss }: InterruptBannerProps) {

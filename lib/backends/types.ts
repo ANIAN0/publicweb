@@ -58,7 +58,7 @@ export interface BackendAdapter extends BackendDescriptor {
   stop(sessionId: string): Promise<void>;
   /** 订阅一个 session 的事件 */
   // LIB-015：EventBus 始终传入 eventId（number），与实现一致；可选的是 sinceEventId
-  onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId: number) => void, sinceEventId?: number): () => void;
+  onEvent(sessionId: string, cb: (e: WebtoolEvent, eventId: number, runId?: string) => void, sinceEventId?: number): () => void;
   /** reload 后追回崩溃窗口遗漏事件(eveagent 实现,local 无);SSE 连接时触发 */
   resume?(sessionId: string, signal: AbortSignal): Promise<void>;
   // 预留:per-target 模型切换(内嵌 eveagent 改文件重启场景),当前不实现,场景来时加

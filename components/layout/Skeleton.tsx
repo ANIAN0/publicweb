@@ -1,14 +1,18 @@
-// 列表骨架:加载时渲染贴合最终布局的灰条占位,替代纯文字/spinner
-// 设计参考 Notion 骨架屏(内容形占位,加载完成无布局跳动)
-// animate-pulse 呼吸;reduced-motion 由 globals.css 全局守护降级为瞬切
+// 列表骨架:加载时渲染贴合最终布局的灰条占位
+// LAYOUT-001：抽出可复用 Skeleton 原语（对齐 shadcn skeleton 的 animate-pulse 语义）
 import { cn } from '@/lib/utils';
+
+/** 基础骨架块（等同 shadcn Skeleton 最小实现） */
+export function Skeleton({ className }: { className?: string }) {
+  return <div className={cn('rounded-md bg-muted animate-pulse', className)} />;
+}
 
 // 单行骨架:模拟列表项高度
 export function SkeletonRow({ className }: { className?: string }) {
-  return <div className={cn('h-12 rounded-lg bg-muted animate-pulse', className)} />;
+  return <Skeleton className={cn('h-12 rounded-lg', className)} />;
 }
 
-// 列表骨架:渲染 count 个 SkeletonRow,间距与真实列表一致
+// 列表骨架:渲染 count 个 SkeletonRow
 export function SkeletonList({ count = 4, className }: { count?: number; className?: string }) {
   return (
     <div className={cn('mx-auto max-w-3xl space-y-1', className)}>

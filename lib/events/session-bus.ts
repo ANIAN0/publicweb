@@ -13,31 +13,19 @@ declare global {
   // 避免 Next.js HMR 反复 new 丢缓冲
   // eslint-disable-next-line no-var
   var __sessionEventBus: EventBusCore | undefined;
-  // sessionId → 串行 persist 链（防 messages.seq UNIQUE 撞车）
-  // eslint-disable-next-line no-var
-  var __sessionPersistChains: Map<string, Promise<void>> | undefined;
 }
 
 const core: EventBusCore = global.__sessionEventBus ?? new EventBusCore();
 if (!global.__sessionEventBus) global.__sessionEventBus = core;
 
-function persistChains(): Map<string, Promise<void>> {
-  if (!global.__sessionPersistChains) global.__sessionPersistChains = new Map();
-  return global.__sessionPersistChains;
-}
-
 /** emit 后串行落库（唯一权威路径） */
 function enqueuePersist(sessionId: string, event: WebtoolEvent, runId?: string): void {
-  const chains = persistChains();
-  const prev = chains.get(sessionId) ?? Promise.resolve();
-  const next = prev
-    .then(() => persistSessionEvent(sessionId, event, runId))
+  void persistSessionEvent(sessionId, event, runId)
     .catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       debugLog('local', `persist failed sid=${sessionId} type=${(event as { type?: string }).type} err=${msg}`);
       console.error(`[session-bus] persist failed sid=${sessionId}:`, err);
     });
-  chains.set(sessionId, next);
 }
 
 /**
@@ -48,6 +36,7 @@ export const sessionEventBus = {
   subscribe: core.subscribe.bind(core) as EventBusCore['subscribe'],
   release: core.release.bind(core) as EventBusCore['release'],
   sessionCount: core.sessionCount.bind(core) as EventBusCore['sessionCount'],
+  getLastId: core.getLastId.bind(core) as EventBusCore['getLastId'],
   emit(sessionId: string, event: WebtoolEvent, runIdHint?: string): number {
     const effectiveRunId = runIdHint ?? generationStream.getActiveRunId(sessionId);
     // 展示缓冲：有活跃 run 则赋 seq（无则 skip，不阻塞权威路径）
@@ -64,6 +53,6 @@ export const sessionEventBus = {
     }
     // 权威落库：单点串行（DEF-001）
     enqueuePersist(sessionId, event, effectiveRunId);
-    return core.emit(sessionId, event);
+    return core.emit(sessionId, event, effectiveRunId);
   },
 };

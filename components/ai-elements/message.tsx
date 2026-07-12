@@ -8,7 +8,6 @@ import {
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -98,15 +97,16 @@ export const MessageAction = ({
   );
 
   if (tooltip) {
+    // COMP-010：不在每个 Action 包 TooltipProvider；依赖页面/MessageActions 外层 Provider
+    // （session page / MessageMeta 祖先已有 TooltipProvider；无则 Tooltip 仍可降级渲染）
+    // Base UI：render 合并为单一 button，禁止 <TooltipTrigger><Button/></TooltipTrigger> 双层 button
     return (
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger>{button}</TooltipTrigger>
-          <TooltipContent>
-            <p>{tooltip}</p>
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger render={button} />
+        <TooltipContent>
+          <p>{tooltip}</p>
+        </TooltipContent>
+      </Tooltip>
     );
   }
 

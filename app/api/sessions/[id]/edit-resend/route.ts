@@ -15,6 +15,7 @@ import { parseJsonBody } from '@/lib/api/parse-json-body';
 import { ulid } from 'ulid';
 import { TurnBusyError, releaseTurnLock, settleTurnLock, withTurnLock } from '@/lib/backends/turn-lock';
 import { beginTurnMaterialize } from '@/lib/backends/persist';
+import { validateTargetModel } from '@/lib/backends/validate-model';
 
 type Mode = 'edit' | 'resend' | 'regenerate';
 
@@ -23,6 +24,7 @@ const editResendSchema = z.object({
   messageId: z.string().min(1),
   content: z.string().optional(),
   mode: z.enum(['edit', 'resend', 'regenerate']).optional(),
+  model: z.string().min(1).optional(),
 }).superRefine((b, ctx) => {
   const mode = b.mode ?? 'resend';
   if (mode === 'edit' && (!b.content || !b.content.trim())) {
@@ -80,6 +82,13 @@ export async function POST(
   }
 
   const adapter = getBackendAdapter(session.backend);
+  const sendModel = body.model ?? session.model;
+  if (body.model) {
+    const modelError = await validateTargetModel(adapter, session.targetId, body.model);
+    if (modelError) {
+      return NextResponse.json({ error: modelError }, { status: 400 });
+    }
+  }
 
   // APP-008/009：history 不含当前待重发 user（send 单独推），避免双份
   const history = await loadConversationHistory(sessionId, {
@@ -117,7 +126,7 @@ export async function POST(
     await adapter.stop(sessionId).catch(() => {});
     await adapter.startSession({
       sessionId,
-      model: session.model,
+      model: sendModel,
       targetId: session.targetId,
       history,
       cwd: session.cwd ?? undefined,
@@ -152,7 +161,7 @@ export async function POST(
       }).where(eq(sessions.id, sessionId));
     });
     beginTurnMaterialize(sessionId, runId);
-    await adapter.send(sessionId, sendContent, { runId });
+    await adapter.send(sessionId, sendContent, { runId, model: sendModel });
   } catch (err) {
     await settleTurnLock(sessionId, runId);
     const msg = err instanceof Error ? err.message : String(err);

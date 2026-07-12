@@ -42,6 +42,8 @@ export type WsToClient =
       /** 中心分配；执行端不得改写或另造 */
       runId: string;
       attachments?: WsAttachmentPayload[];
+      /** 可选：本次发送要用的 model id；不传则用 session 启动时锁定的 model */
+      model?: string;
     }
   // session.respondInput：HITL 独立通道
   | { type: 'session.respondInput'; sessionId: string; responses: InputResponse[] }

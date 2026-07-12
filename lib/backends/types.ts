@@ -46,7 +46,7 @@ export interface BackendAdapter extends BackendDescriptor {
   send(
     sessionId: string,
     content: string,
-    opts?: { attachments?: MessageAttachmentRef[]; runId?: string },
+    opts?: { attachments?: MessageAttachmentRef[]; runId?: string; model?: string },
   ): Promise<void>;
   /**
    * 回答 HITL（ask_question / tool-approval / AskUserQuestion）。

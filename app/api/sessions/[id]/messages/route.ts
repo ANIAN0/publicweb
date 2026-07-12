@@ -20,6 +20,7 @@ import { TurnBusyError, withTurnLock, releaseTurnLock } from '@/lib/backends/tur
 import { mimeFromFilename } from '@/lib/mime';
 import { sessionEventBus } from '@/lib/events/session-bus';
 import { eventBus } from '@/lib/backends/event-bus';
+import { validateTargetModel } from '@/lib/backends/validate-model';
 
 // APP-004：messages POST body Zod 校验
 const messagePostSchema = z.object({
@@ -35,6 +36,8 @@ const messagePostSchema = z.object({
       }),
     )
     .optional(),
+  // 可选：本次发送要用的 model id（chat 页切换模型用）；不传则用 session 启动时的 model
+  model: z.string().min(1).optional(),
 }).refine(
   (b) => (typeof b.content === 'string' && b.content.trim().length > 0) || (b.attachments?.length ?? 0) > 0,
   { message: 'content or attachments required' },
@@ -124,6 +127,13 @@ export async function POST(
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
   const db = await getDb();
+  const adapter = getBackendAdapter(session.backend);
+  if (parsed.data.model) {
+    const modelError = await validateTargetModel(adapter, session.targetId, parsed.data.model);
+    if (modelError) {
+      return NextResponse.json({ error: modelError }, { status: 400 });
+    }
+  }
 
   // 组装 user parts：text + file（AI SDK FileUIPart 形态）
   const parts: Array<Record<string, unknown>> = [];
@@ -205,7 +215,6 @@ export async function POST(
   }
 
   // 通过 backend adapter 发送（含附件引用）
-  const adapter = getBackendAdapter(session.backend);
   // 新一轮物化：丢弃上一 turn 的 settled 快照，避免与迟到 chunk 交错
   beginTurnMaterialize(id, runId);
   // agent 侧 content：用户原文；仅附件时用简短占位，各 adapter 会再注入附件
@@ -214,6 +223,8 @@ export async function POST(
     await adapter.send(id, agentContent, {
       ...(resolved.length ? { attachments: resolved } : {}),
       runId,
+      // 透传 chat 页切换的 model；未传则 adapter 不下发 model 字段，client 走 session 初始 model
+      ...(parsed.data.model ? { model: parsed.data.model } : {}),
     });
   } catch (err) {
     await db.update(sessions).set({

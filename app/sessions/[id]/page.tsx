@@ -43,6 +43,14 @@ import { SpeechInput } from '@/components/ai-elements/speech-input';
 import type { InputResponse } from '@/lib/protocol/events';
 import { MAX_CHAT_MESSAGE_CHARS, getChatMessageLength } from '@/lib/chat/limits';
 import { backendLabel } from '@/lib/backends/labels';
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 
 // 空态建议 prompt
 const EMPTY_SUGGESTIONS = [
@@ -61,6 +69,8 @@ interface SessionInfo {
   title: string | null;
   userTitle: string | null;
 }
+
+type ModelOption = { id: string; label: string; isDefault?: boolean };
 
 /** 附件上传态：idle 芯片 / uploading / done / failed+重试 */
 type UploadRow = {
@@ -241,6 +251,8 @@ export default function SessionPage() {
   const [input, setInput] = useState('');
   const [retrying, setRetrying] = useState(false);
   const [sessionInfo, setSessionInfo] = useState<SessionInfo | null>(null);
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [selectedModel, setSelectedModel] = useState('');
   // 编辑中的 user messageId：提交时走 edit-resend 而非普通 send
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   // 附件上传状态机（queued → uploading → done | failed）
@@ -310,7 +322,10 @@ export default function SessionPage() {
     fetch(`/api/sessions/${id}`, { signal: ac.signal })
       .then((res) => (res.ok ? res.json() : null))
       .then((data: SessionInfo | null) => {
-        if (data) setSessionInfo(data);
+        if (data) {
+          setSessionInfo(data);
+          setSelectedModel(data.model);
+        }
       })
       .catch((err: unknown) => {
         // AbortError 属正常取消，忽略
@@ -318,6 +333,42 @@ export default function SessionPage() {
       });
     return () => ac.abort();
   }, [id]);
+
+  // 本地执行端的 catalog 来自 client 上行缓存；只在 target/session 就绪后请求。
+  useEffect(() => {
+    if (
+      !sessionInfo?.targetId ||
+      (sessionInfo.backend !== 'claudecode' && sessionInfo.backend !== 'pi')
+    ) {
+      setModels([]);
+      return;
+    }
+    const ac = new AbortController();
+    setModels([]);
+    fetch(`/api/devices/${sessionInfo.targetId}/models`, { signal: ac.signal })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`模型列表加载失败: ${res.status}`);
+        return res.json() as Promise<Array<{ backend: string; models: ModelOption[] }>>;
+      })
+      .then((rows) => {
+        const row = rows.find((item) => item.backend === sessionInfo.backend);
+        const next = Array.isArray(row?.models) ? row.models : [];
+        setModels(next);
+        if (next.length > 0) {
+          setSelectedModel((current) =>
+            next.some((model) => model.id === current)
+              ? current
+              : (next.find((model) => model.isDefault) ?? next[0]).id,
+          );
+        }
+      })
+      .catch((err: unknown) => {
+        if (err instanceof Error && err.name === 'AbortError') return;
+        setModels([]);
+        toast.error(err instanceof Error ? err.message : '模型列表加载失败');
+      });
+    return () => ac.abort();
+  }, [sessionInfo?.backend, sessionInfo?.targetId]);
 
   // sendError → toast（避免重复）
   useEffect(() => {
@@ -372,7 +423,14 @@ export default function SessionPage() {
       const draft = content.trim();
       setEditingMessageId(null);
       setInput('');
-      const ok = await editResend({ messageId: mid, mode: 'edit', content: draft });
+      const ok = await editResend({
+        messageId: mid,
+        mode: 'edit',
+        content: draft,
+        ...(models.some((item) => item.id === selectedModel)
+          ? { model: selectedModel }
+          : {}),
+      });
       if (!ok) {
         // 与 HOOK-004 一致：失败恢复草稿，便于重试
         setInput(draft);
@@ -438,7 +496,12 @@ export default function SessionPage() {
     setUploadRows([]);
     const ok = await send(
       content,
-      uploaded.length ? { attachments: uploaded } : undefined,
+      {
+        ...(uploaded.length ? { attachments: uploaded } : {}),
+        ...(models.some((item) => item.id === selectedModel)
+          ? { model: selectedModel }
+          : {}),
+      },
     );
     if (!ok) {
       setInput(content);
@@ -462,18 +525,30 @@ export default function SessionPage() {
 
   const handleResendMessage = useCallback(
     async (messageId: string) => {
-      const ok = await editResend({ messageId, mode: 'resend' });
+      const ok = await editResend({
+        messageId,
+        mode: 'resend',
+        ...(models.some((item) => item.id === selectedModel)
+          ? { model: selectedModel }
+          : {}),
+      });
       if (!ok) toast.error('重发失败');
     },
-    [editResend],
+    [editResend, models, selectedModel],
   );
 
   const handleRegenerate = useCallback(
     async (messageId: string) => {
-      const ok = await editResend({ messageId, mode: 'regenerate' });
+      const ok = await editResend({
+        messageId,
+        mode: 'regenerate',
+        ...(models.some((item) => item.id === selectedModel)
+          ? { model: selectedModel }
+          : {}),
+      });
       if (!ok) toast.error('再生成失败');
     },
-    [editResend],
+    [editResend, models, selectedModel],
   );
 
   const handleFork = useCallback(
@@ -540,7 +615,7 @@ export default function SessionPage() {
     sessionInfo?.title?.trim() ||
     '对话';
   const backendName = sessionInfo ? backendLabel(sessionInfo.backend) : null;
-  const modelName = sessionInfo?.model?.trim() || null;
+  const modelName = selectedModel.trim() || sessionInfo?.model?.trim() || null;
   // 工作目录：仅 local 后端有意义；空则 client 默认
   const cwdLabel =
     sessionInfo?.backend === 'claudecode' || sessionInfo?.backend === 'pi'
@@ -759,15 +834,33 @@ export default function SessionPage() {
                         return '';
                       }}
                     />
-                    {/* 模型只读指示（切换需新建会话；不再进页拉 /models） */}
-                    {modelName && (
+                    {models.length > 0 ? (
+                      <Select
+                        value={selectedModel}
+                        onValueChange={(value) => setSelectedModel(value ?? '')}
+                        disabled={sending || hasPendingInput}
+                      >
+                        <SelectTrigger size="sm" aria-label="选择本次消息使用的模型">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent align="start">
+                          <SelectGroup>
+                            {models.map((model) => (
+                              <SelectItem key={model.id} value={model.id}>
+                                {model.label}
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                    ) : modelName ? (
                       <span
                         className="max-w-[10rem] truncate px-1 font-mono text-[11px] text-muted-foreground"
                         title={modelName}
                       >
                         {modelName}
                       </span>
-                    )}
+                    ) : null}
                     {input.length > 0 && (
                       <span
                         className={

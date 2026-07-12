@@ -388,6 +388,7 @@ export interface UseSessionMessagesResult {
     content: string,
     opts?: {
       attachments?: Array<{ id: string; filename: string; mediaType: string; size?: number; url?: string }>;
+      model?: string;
     },
   ) => Promise<boolean>;
   stop: () => Promise<void>;
@@ -400,6 +401,7 @@ export interface UseSessionMessagesResult {
     messageId: string;
     mode: 'edit' | 'resend' | 'regenerate';
     content?: string;
+    model?: string;
   }) => Promise<boolean>;
   /** 从某条消息 fork 新会话；成功返回新 sessionId */
   forkFrom: (fromMessageId: string) => Promise<string | null>;
@@ -653,6 +655,7 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
       content: string,
       opts?: {
         attachments?: Array<{ id: string; filename: string; mediaType: string; size?: number; url?: string }>;
+        model?: string;
       },
     ): Promise<boolean> => {
       const attachments = opts?.attachments ?? [];
@@ -712,6 +715,7 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
           body: JSON.stringify({
             content,
             ...(attachments.length ? { attachments } : {}),
+            ...(opts?.model ? { model: opts.model } : {}),
           }),
         });
         if (!res.ok) {
@@ -886,6 +890,7 @@ export function useSessionMessages(sessionId: string): UseSessionMessagesResult 
       messageId: string;
       mode: 'edit' | 'resend' | 'regenerate';
       content?: string;
+      model?: string;
     }): Promise<boolean> => {
       if (sending) return false;
       setSending(true);

@@ -176,7 +176,7 @@ export class LocalBackend implements BackendAdapter {
   async send(
     sessionId: string,
     content: string,
-    opts?: { attachments?: MessageAttachmentRef[]; runId?: string },
+    opts?: { attachments?: MessageAttachmentRef[]; runId?: string; model?: string },
   ): Promise<void> {
     try {
       const targetId = await this.resolveTargetId(sessionId);
@@ -212,6 +212,8 @@ export class LocalBackend implements BackendAdapter {
         content,
         runId,
         ...(attachments?.length ? { attachments } : {}),
+        // 透传 chat 页切换的 model；未传时由 client 走 session 初始 model
+        ...(opts?.model ? { model: opts.model } : {}),
       });
       if (!ok) throw new Error(`device not connected: ${targetId}`);
     } catch (err) {

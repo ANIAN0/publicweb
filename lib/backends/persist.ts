@@ -361,12 +361,16 @@ async function materializeAuthorityChunk(
     case 'tool-input-available': {
       const buffered = state.toolInputBuf.get(chunk.toolCallId);
       state.toolInputBuf.delete(chunk.toolCallId);
+      const meta = (chunk as { toolMetadata?: unknown }).toolMetadata;
       upsertToolPart(state, chunk.toolCallId, {
         type: 'dynamic-tool',
         toolName: chunk.toolName,
         state: 'input-available',
         input: chunk.input ?? buffered ?? {},
         ...(chunk.title ? { title: chunk.title } : {}),
+        ...(meta !== undefined
+          ? { toolMetadata: meta as Record<string, unknown> }
+          : {}),
       });
       await ensureOpenAssistant(sessionId, state, state.preferredMessageId);
       await flushOpenAssistant(sessionId, state);
@@ -387,10 +391,23 @@ async function materializeAuthorityChunk(
     }
 
     case 'tool-approval-request': {
+      // tool-input-available 写入的 toolMetadata 在 approval 帧后必须保留；浅 merge 不够，
+      // 这里显式 prevMeta 兜底，防止 patch 里出现 toolMetadata: undefined 时把已有 meta 抹掉。
+      const idx = findToolPartIndex(state.parts, chunk.toolCallId);
+      const prevMeta =
+        idx >= 0
+          ? (state.parts[idx] as { toolMetadata?: unknown }).toolMetadata
+          : undefined;
+      const chunkMeta = (chunk as { toolMetadata?: unknown }).toolMetadata;
       upsertToolPart(state, chunk.toolCallId, {
         type: 'dynamic-tool',
         state: 'approval-requested',
         approval: { id: chunk.approvalId },
+        ...(chunkMeta !== undefined
+          ? { toolMetadata: chunkMeta as Record<string, unknown> }
+          : prevMeta !== undefined
+            ? { toolMetadata: prevMeta as Record<string, unknown> }
+            : {}),
       });
       await ensureOpenAssistant(sessionId, state, state.preferredMessageId);
       await flushOpenAssistant(sessionId, state);

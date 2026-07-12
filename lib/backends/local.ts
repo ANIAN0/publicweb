@@ -223,7 +223,11 @@ export class LocalBackend implements BackendAdapter {
     }
   }
 
-  async respondInput(sessionId: string, responses: InputResponse[]): Promise<void> {
+  async respondInput(
+    sessionId: string,
+    responses: InputResponse[],
+    _opts?: { runId?: string },
+  ): Promise<void> {
     try {
       const targetId = await this.resolveTargetId(sessionId);
       if (!targetId) throw new Error(`session ${sessionId} not bound to a target`);

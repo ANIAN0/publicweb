@@ -52,7 +52,10 @@ export type ReasoningProps = ComponentProps<typeof Collapsible> & {
   duration?: number;
 };
 
-const AUTO_CLOSE_DELAY = 1000;
+// 结束后自动折叠的延迟：30s。
+// 原为 1000ms —— tool 一出现 think 就在约 1 秒内收起，用户感知为「思考过程被清空、无处可查」（DIAG-005 主诉）。
+// 30s 给用户留出发现与点开的时间；折叠后入口仍在，可随时展开。禁止改回 1000 或 0。
+const AUTO_CLOSE_DELAY = 30000;
 const MS_IN_S = 1000;
 
 export const Reasoning = memo(
@@ -154,14 +157,16 @@ export type ReasoningTriggerProps = ComponentProps<
   getThinkingMessage?: (isStreaming: boolean, duration?: number) => ReactNode;
 };
 
+// 默认思考入口文案（中文）：流式中「思考中…」；结束后「思考过程」/「思考了 N 秒」。
+// 保留 duration 逻辑；调用方仍可用 getThinkingMessage 覆盖。
 const defaultGetThinkingMessage = (isStreaming: boolean, duration?: number) => {
   if (isStreaming || duration === 0) {
-    return <Shimmer duration={1}>Thinking...</Shimmer>;
+    return <Shimmer duration={1}>思考中…</Shimmer>;
   }
   if (duration === undefined) {
-    return <p>Thought for a few seconds</p>;
+    return <p>思考过程</p>;
   }
-  return <p>Thought for {duration} seconds</p>;
+  return <p>思考了 {duration} 秒</p>;
 };
 
 export const ReasoningTrigger = memo(

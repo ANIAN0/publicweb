@@ -23,6 +23,7 @@ import { useStreamingText } from '@/hooks/use-streaming-text';
 const streamdownPlugins = { cjk, code, math, mermaid };
 
 // AssistantTextPart:text part 用 useStreamingText 分步 reveal 喂 Streamdown(T-010 流式平滑)
+// cacheKey 须含 message 作用域，避免跨消息复用同一 _pid 时 reveal 缓存串台（DIAG-006）
 function AssistantTextPart({ text, cacheKey }: { text: string; cacheKey?: string }) {
   const displayText = useStreamingText(text, cacheKey);
   return <Streamdown plugins={streamdownPlugins}>{displayText}</Streamdown>;
@@ -79,20 +80,32 @@ function FilePartView({ part, keyId }: { part: UIMessagePart<any, any>; keyId: n
 }
 
 // 渲染非 dynamic-tool / 非 text 缓冲 part(reasoning/file/default)
-function renderPart(part: UIMessagePart<any, any>, key: number): ReactNode {
+function renderPart(
+  part: UIMessagePart<any, any>,
+  key: number,
+  messageId?: string,
+): ReactNode {
   switch (part.type) {
-    case 'text':
+    case 'text': {
       // 文本:useStreamingText 分步 reveal 喂 Streamdown(含 code/math/mermaid,T-010 流式平滑)
-      return <AssistantTextPart key={key} text={part.text} cacheKey={(part as PersistedPart)._pid} />
-    case 'reasoning':
-      // 思考:折叠展示;state=streaming 时自动展开 + Shimmer "Thinking..."
+      const pid = (part as PersistedPart)._pid;
+      const cacheKey = messageId && pid ? `${messageId}:${pid}` : pid;
+      return <AssistantTextPart key={key} text={part.text} cacheKey={cacheKey} />;
+    }
+    case 'reasoning': {
+      // 思考:折叠展示;state=streaming 时自动展开 + Shimmer「思考中…」
+      const text = typeof part.text === 'string' ? part.text : '';
+      const streaming = part.state === 'streaming';
+      // 空内容且非流式 → 不渲染,避免留下点不开的假入口(DIAG-005;流式期即使暂空仍显示「思考中」)
+      if (!streaming && !text.trim()) return null;
       return (
-        <Reasoning key={key} isStreaming={part.state === 'streaming'}>
+        <Reasoning key={key} isStreaming={streaming}>
           <ReasoningTrigger />
           {/* ReasoningContent 内部用 Streamdown 渲染 children(string) */}
-          <ReasoningContent>{part.text}</ReasoningContent>
+          <ReasoningContent>{text}</ReasoningContent>
         </Reasoning>
       );
+    }
     case 'file':
       return <FilePartView key={key} part={part} keyId={key} />;
     default:
@@ -111,9 +124,12 @@ function renderPart(part: UIMessagePart<any, any>, key: number): ReactNode {
 
 export function MessageParts({
   parts,
+  messageId,
   onRespond,
 }: {
   parts: UIMessagePart<any, any>[];
+  /** 用于 streaming cacheKey 作用域隔离（DIAG-006） */
+  messageId?: string;
   // HITL 回答回调:ToolGroup 内 dynamic-tool part 的 InputRequestActions 用它提交回答(eve ask_question / approval)
   onRespond?: (response: InputResponse) => void;
 }) {
@@ -145,7 +161,9 @@ export function MessageParts({
       .join('\n\n');
     const firstPid = texts[0]?._pid;
     const joinedPids = texts.map((p) => p._pid).filter(Boolean).join('+');
-    const cacheKey = firstPid || joinedPids || `txt-${textIdx}`;
+    const rawKey = firstPid || joinedPids || `txt-${textIdx}`;
+    // messageId 作用域：禁止跨 assistant 消息复用同一 _pid 时 reveal 缓存串台
+    const cacheKey = messageId ? `${messageId}:${rawKey}` : rawKey;
     out.push(<AssistantTextPart key={`tx-${textIdx++}`} text={merged} cacheKey={cacheKey} />);
   };
 
@@ -163,7 +181,7 @@ export function MessageParts({
     // file / reasoning / 其他：打断 text 与 tool 缓冲
     flushTools();
     flushTexts();
-    out.push(renderPart(part, i));
+    out.push(renderPart(part, i, messageId));
   });
   flushTools();
   flushTexts();

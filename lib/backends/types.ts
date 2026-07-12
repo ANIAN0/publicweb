@@ -52,8 +52,13 @@ export interface BackendAdapter extends BackendDescriptor {
    * 回答 HITL（ask_question / tool-approval / AskUserQuestion）。
    * 与 send 语义分离：不插 user 消息，只续接当前 turn 的输入请求。
    * responses 可多项（多 request 并行回答）；各后端 narrow 自己的形态。
+   * opts.runId：调用方已 withTurnLock 时传入（与 send 一致）；否则后端可自取/新建。
    */
-  respondInput(sessionId: string, responses: InputResponse[]): Promise<void>;
+  respondInput(
+    sessionId: string,
+    responses: InputResponse[],
+    opts?: { runId?: string },
+  ): Promise<void>;
   /** 主动停止当前 turn（不 kill agent 进程） */
   stop(sessionId: string): Promise<void>;
   /** 订阅一个 session 的事件 */

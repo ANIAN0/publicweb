@@ -734,7 +734,11 @@ export default function SessionPage() {
                     className={m.metadata?.optimistic ? 'opacity-90' : undefined}
                   >
                     <MessageContent>
-                      <MessageParts parts={m.parts} onRespond={handleRespond} />
+                      <MessageParts
+                        parts={m.parts}
+                        messageId={m.id}
+                        onRespond={handleRespond}
+                      />
                     </MessageContent>
                     {(m.role === 'user' || m.role === 'assistant') && (
                       <MessageMeta

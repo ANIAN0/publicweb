@@ -1,6 +1,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
+import { formatPartsForExport } from "@/lib/chat/parts";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
@@ -104,11 +105,11 @@ export const ConversationScrollButton = ({
   );
 };
 
+// 下载 Markdown 用：含 reasoning（思考过程）+ text；与 agent history 的 text-only 分离（D-R05）
 const getMessageText = (message: UIMessage): string =>
-  message.parts
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("");
+  formatPartsForExport(
+    message.parts as ReadonlyArray<{ type: string; text?: string }>,
+  );
 
 export type ConversationDownloadProps = Omit<
   ComponentProps<typeof Button>,

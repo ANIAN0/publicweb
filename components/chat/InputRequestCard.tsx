@@ -179,6 +179,10 @@ function HitlStepper({
   canRespond: boolean;
   onRespond: (r: InputResponse) => void;
 }) {
+  // 仅 id 为 deny/reject 时一键 decision:deny（REV-006-01：禁止用 style:danger 误伤 eve 等其它危险选项）
+  // adapter 仍对 optionId deny|reject 做第二道归一（T-103）
+  const isDenyOption = (opt: HitlOption): boolean =>
+    opt.id === 'deny' || opt.id === 'reject';
   const [index, setIndex] = useState(0);
   // questionId → 答案
   const [answers, setAnswers] = useState<Record<string, LocalAnswer>>({});
@@ -208,6 +212,12 @@ function HitlStepper({
 
   const selectOption = (optionId: string) => {
     if (!canRespond) return;
+    // REV-005-02：单题 + deny option 时直接发 decision: 'deny'（双保险；adapter 仍兜底）
+    const opt = q.options?.find((o) => o.id === optionId);
+    if (!isMulti && opt && isDenyOption(opt)) {
+      onRespond({ requestId, decision: 'deny', optionId: opt.id });
+      return;
+    }
     patchAnswer({ optionId });
     // 选完选项：若无 freeform 且非最后一题，可自动下一步；保留 notes 区给用户补写
     setNotes(answers[q.id]?.text ?? '');

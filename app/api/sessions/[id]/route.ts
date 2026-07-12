@@ -3,9 +3,8 @@ import { getDb } from '@/lib/db/client';
 import { sessions } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
-import { debugLog } from '@/lib/debug-log';
 import { getActiveSession, getSessionById } from '@/lib/api/get-active-session';
-import { releaseTurnLock } from '@/lib/backends/turn-lock';
+import { softDeleteSession } from '@/lib/api/soft-delete-session';
 
 export async function GET(
   request: NextRequest,
@@ -74,31 +73,10 @@ export async function DELETE(
 ) {
   const { id } = await params;
 
-  // APP-001：必须未删除才允许 DELETE
-  const session = await getActiveSession(id);
-  if (!session) {
+  // APP-001：与 bulk-delete 共用 softDeleteSession
+  const result = await softDeleteSession(id);
+  if (result === 'skipped') {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
-  }
-
-  const db = await getDb();
-  await db.update(sessions).set({ deletedAt: new Date() }).where(eq(sessions.id, id));
-  await releaseTurnLock(id);
-  // 软删后释放 Local persist 订阅，避免会话幽灵订阅占内存
-  // APP-002：保留动态 import（避循环依赖）+ debugLog；必须调用 releaseRuntime
-  try {
-    debugLog('app', `DELETE session releaseRuntime sid=${id} backend=${session.backend}`);
-    const { getBackendAdapter } = await import('@/lib/backends/router');
-    const adapter = getBackendAdapter(session.backend) as {
-      releaseRuntime?: (sid: string) => void;
-      stop?: (sid: string) => Promise<void>;
-    };
-    adapter.releaseRuntime?.(id);
-    await adapter.stop?.(id);
-  } catch (err) {
-    debugLog(
-      'app',
-      `DELETE session release failed sid=${id} err=${err instanceof Error ? err.message : String(err)}`,
-    );
   }
   return NextResponse.json({ id, deletedAt: new Date().toISOString() });
 }

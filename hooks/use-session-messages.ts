@@ -71,6 +71,26 @@ function findToolPartIndex(parts: PersistedPart[], toolCallId: string): number {
   });
 }
 
+// 只读:当前 open assistant 是否已存在该 _pid(镜像 getOrCreateCurrentAssistant 的选择逻辑,不新建消息)。
+// 用途:reasoning-start / text-start 二次 start 时判断 part 是否已存在,避免用空 text 抹掉已累积正文(D-R03)。
+function currentAssistantHasPart(messages: FrontendMessage[], partId: string): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === 'assistant' && m.metadata?.finishReason === undefined) {
+      return findPartIndex(m.parts as PersistedPart[], partId) >= 0;
+    }
+  }
+  return false;
+}
+
+// 从 chunk.providerMetadata.webtool.text 读权威全文快照(与 persist / claude collector 契约一致)。
+// 非 string 返回 undefined,由调用方决定是否保留 delta 累积。
+function readWebtoolTextSnapshot(chunk: UIMessageChunk): string | undefined {
+  const snapshot = (chunk as { providerMetadata?: { webtool?: { text?: unknown } } })
+    .providerMetadata?.webtool?.text;
+  return typeof snapshot === 'string' ? snapshot : undefined;
+}
+
 function upsertPart(
   messages: FrontendMessage[],
   partId: string,
@@ -87,6 +107,33 @@ function upsertPart(
     parts.push({ ...patch, _pid: partId } as PersistedPart);
   } else {
     parts[idx] = { ...parts[idx], ...patch, _pid: partId } as PersistedPart;
+  }
+  return m1.map((m) => (m === current ? { ...m, parts } : m));
+}
+
+/**
+ * 双物化对齐 persist：tool-approval-request 不能把 tool-input-available 已写入的 toolMetadata 抹掉。
+ * 显式读 prev toolMetadata；若 patch 不含 toolMetadata 字段则回写 prev。
+ */
+function upsertPartPreservingMeta(
+  messages: FrontendMessage[],
+  partId: string,
+  patch: Record<string, unknown>,
+): FrontendMessage[] {
+  const cleared = clearLastOptimistic(messages);
+  const { messages: m1, current } = getOrCreateCurrentAssistant(cleared);
+  const parts = current.parts.slice();
+  let idx = findPartIndex(parts, partId);
+  if (idx < 0) idx = findToolPartIndex(parts, partId);
+  if (idx < 0) {
+    parts.push({ ...patch, _pid: partId } as PersistedPart);
+  } else {
+    const prev = parts[idx] as { toolMetadata?: Record<string, unknown> };
+    const finalPatch: Record<string, unknown> = { ...patch, _pid: partId };
+    if (patch.toolMetadata === undefined && prev.toolMetadata !== undefined) {
+      finalPatch.toolMetadata = prev.toolMetadata;
+    }
+    parts[idx] = { ...parts[idx], ...finalPatch } as PersistedPart;
   }
   return m1.map((m) => (m === current ? { ...m, parts } : m));
 }
@@ -133,8 +180,13 @@ function applyChunk(messages: FrontendMessage[], chunk: UIMessageChunk): Fronten
       }
       return m1;
     }
-    case 'text-start':
-      return upsertPart(messages, chunk.id, { type: 'text', text: '', state: 'streaming' }, true);
+    case 'text-start': {
+      // 对称于 reasoning-start:已存在则不写空 text,避免二次 start 抹掉已累积正文
+      const patch = currentAssistantHasPart(messages, chunk.id)
+        ? { type: 'text', state: 'streaming' }
+        : { type: 'text', text: '', state: 'streaming' };
+      return upsertPart(messages, chunk.id, patch, true);
+    }
     case 'text-delta': {
       const { messages: m1, current } = getOrCreateCurrentAssistant(messages);
       const idx = findPartIndex(current.parts, chunk.id);
@@ -152,15 +204,23 @@ function applyChunk(messages: FrontendMessage[], chunk: UIMessageChunk): Fronten
       parts[idx] = { ...parts[idx], ...p, state: 'streaming' } as PersistedPart;
       return m1.map((m) => (m === current ? { ...m, parts } : m));
     }
-    case 'text-end':
-      return upsertPart(messages, chunk.id, { type: 'text', state: 'done' }, true);
-    case 'reasoning-start':
-      return upsertPart(
-        messages,
-        chunk.id,
-        { type: 'reasoning', text: '', state: 'streaming' },
-        true,
-      );
+    case 'text-end': {
+      // 对称于 reasoning-end:带权威 snapshot 则纠正文本,否则仅 done
+      const snapshot = readWebtoolTextSnapshot(chunk);
+      const patch: Record<string, unknown> =
+        snapshot !== undefined
+          ? { type: 'text', text: snapshot, state: 'done' }
+          : { type: 'text', state: 'done' };
+      return upsertPart(messages, chunk.id, patch, true);
+    }
+    case 'reasoning-start': {
+      // 已存在同 _pid → 仅置 streaming,不写 text（空 text 会抹掉已累积正文,DIAG-005 前端根因）
+      // 不存在 → 创建空 text + streaming
+      const patch = currentAssistantHasPart(messages, chunk.id)
+        ? { type: 'reasoning', state: 'streaming' }
+        : { type: 'reasoning', text: '', state: 'streaming' };
+      return upsertPart(messages, chunk.id, patch, true);
+    }
     case 'reasoning-delta': {
       const { messages: m1, current } = getOrCreateCurrentAssistant(messages);
       const idx = findPartIndex(current.parts, chunk.id);
@@ -178,8 +238,15 @@ function applyChunk(messages: FrontendMessage[], chunk: UIMessageChunk): Fronten
       parts[idx] = { ...parts[idx], ...p, state: 'streaming' } as PersistedPart;
       return m1.map((m) => (m === current ? { ...m, parts } : m));
     }
-    case 'reasoning-end':
-      return upsertPart(messages, chunk.id, { type: 'reasoning', state: 'done' }, true);
+    case 'reasoning-end': {
+      // 权威 end 快照优先:带 snapshot 则纠正展示文本(覆盖断 delta 场景),否则仅 done 保留累积
+      const snapshot = readWebtoolTextSnapshot(chunk);
+      const patch: Record<string, unknown> =
+        snapshot !== undefined
+          ? { type: 'reasoning', text: snapshot, state: 'done' }
+          : { type: 'reasoning', state: 'done' };
+      return upsertPart(messages, chunk.id, patch, true);
+    }
     case 'tool-input-start':
       return upsertPart(
         messages,
@@ -214,6 +281,10 @@ function applyChunk(messages: FrontendMessage[], chunk: UIMessageChunk): Fronten
           toolName: chunk.toolName,
           state: 'input-available',
           input: chunk.input,
+          // 通用透传 toolMetadata；inputRequest 等由 collector 在前序帧写入
+          ...(((chunk as { toolMetadata?: unknown }).toolMetadata !== undefined)
+            ? { toolMetadata: (chunk as { toolMetadata?: unknown }).toolMetadata as Record<string, unknown> }
+            : {}),
         },
         true,
       );
@@ -228,19 +299,19 @@ function applyChunk(messages: FrontendMessage[], chunk: UIMessageChunk): Fronten
           state: 'output-error',
           input: chunk.input,
           errorText: chunk.errorText,
+          ...(((chunk as { toolMetadata?: unknown }).toolMetadata !== undefined)
+            ? { toolMetadata: (chunk as { toolMetadata?: unknown }).toolMetadata as Record<string, unknown> }
+            : {}),
         },
         true,
       );
     case 'tool-approval-request':
-      return upsertPart(
-        messages,
-        chunk.toolCallId,
-        {
-          state: 'approval-requested',
-          approval: { id: chunk.approvalId },
-        },
-        true,
-      );
+      // 双物化对齐 persist：显式保留 tool-input-available 已写入的 toolMetadata，
+      // 禁止 patch 含 toolMetadata: undefined 把已有 meta 抹掉。
+      return upsertPartPreservingMeta(messages, chunk.toolCallId, {
+        state: 'approval-requested',
+        approval: { id: chunk.approvalId },
+      });
     case 'tool-approval-response': {
       // 按 approvalId 定位 part（chunk 无 toolCallId）
       let openIdx = -1;

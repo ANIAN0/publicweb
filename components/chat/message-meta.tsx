@@ -13,6 +13,7 @@ import {
 import { toast } from 'sonner';
 import { MessageAction, MessageActions } from '@/components/ai-elements/message';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { formatPartsForExport } from '@/lib/chat/parts';
 import { cn } from '@/lib/utils';
 import { formatRelative } from '@/lib/utils';
 
@@ -29,15 +30,12 @@ export interface MessageMetaProps {
   onFork?: () => void;
 }
 
-// 从 UIMessage.parts 抽可复制纯文本（仅 text part，工具/思考不进剪贴板）
+// 从 UIMessage.parts 抽可复制纯文本：含 text + reasoning（思考过程），省略 tool。
+// agent history 仍走 extractTextFromParts（text-only）；此处是用户「可查看」导出路径（D-R05 / DIAG-005）。
 export function extractMessagePlainText(
   parts: ReadonlyArray<{ type: string; text?: string }>
 ): string {
-  return parts
-    .filter((p) => p.type === 'text' && typeof p.text === 'string')
-    .map((p) => p.text as string)
-    .join('\n\n')
-    .trim();
+  return formatPartsForExport(parts);
 }
 
 // COMP-006：hover/触屏可见性 class 抽常量，避免模板内重复长串

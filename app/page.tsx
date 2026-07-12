@@ -1,9 +1,9 @@
 'use client';
-// 首页:历史会话列表 + 后端筛选 + 标题搜索 + 重命名/删除 + 空状态
+// 首页:历史会话列表 + 后端筛选 + 标题搜索 + 重命名/删除/批量删除 + 空状态
 // 设计参考:open-agents 的 session-list(按日期分组、极简语义色、hover 高亮)+ tool sidebar(hover 才显操作)
-// 数据:GET /api/sessions(filter: backend / q);操作:PATCH /api/sessions/[id](userTitle)、DELETE(软删)
+// 数据:GET /api/sessions(filter: backend / q);操作:PATCH /api/sessions/[id](userTitle)、DELETE(软删)、POST bulk-delete
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Plus,
   Settings,
@@ -18,6 +18,7 @@ import {
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
+import { Checkbox } from '@/components/ui/checkbox';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -76,8 +77,6 @@ function groupByDate(items: SessionItem[]): Map<string, SessionItem[]> {
   return groups;
 }
 
-// 相对时间格式化(formatRelative)与 BACKEND_LABEL 已抽到 lib/utils 与 lib/backends/labels,首页直接 import
-
 export default function Home() {
   const [items, setItems] = useState<SessionItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -86,6 +85,10 @@ export default function Home() {
   // 输入框实时值与 debounce 后的生效值分离,避免每次按键都发请求
   const [qInput, setQInput] = useState('');
   const [q, setQ] = useState('');
+  // 多选：仅当前列表可见项；批量软删走 POST /api/sessions/bulk-delete
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   // 搜索 debounce 250ms:qInput 变化后延迟 250ms 才更新生效的 q
   useEffect(() => {
@@ -103,7 +106,18 @@ export default function Home() {
     setError(null);
     fetch(`/api/sessions?${params.toString()}`, { signal: ac.signal })
       .then((r) => r.json() as Promise<SessionItem[]>)
-      .then((data) => setItems(data))
+      .then((data) => {
+        setItems(data);
+        // 刷新后剔除已不在列表中的选中（含刚删除的）
+        const alive = new Set(data.map((s) => s.id));
+        setSelectedIds((prev) => {
+          const next = new Set<string>();
+          for (const id of prev) {
+            if (alive.has(id)) next.add(id);
+          }
+          return next;
+        });
+      })
       .catch((err) => {
         // AbortError 是组件卸载/筛选切换触发的正常取消,不算错误
         if (err.name !== 'AbortError') setError('加载会话失败,请重试');
@@ -114,6 +128,60 @@ export default function Home() {
   useEffect(reload, [backend, q]);
 
   const groups = groupByDate(items);
+  const visibleIds = useMemo(() => items.map((s) => s.id), [items]);
+  const selectedCount = selectedIds.size;
+  const allVisibleSelected =
+    visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
+
+  const toggleOne = (id: string, checked: boolean) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const selectAllVisible = () => {
+    setSelectedIds(new Set(visibleIds));
+  };
+
+  const clearSelection = () => {
+    setSelectedIds(new Set());
+  };
+
+  const invertSelection = () => {
+    setSelectedIds((prev) => {
+      const next = new Set<string>();
+      for (const id of visibleIds) {
+        if (!prev.has(id)) next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const confirmBulkDeleteAction = async () => {
+    if (selectedCount === 0) return;
+    setBulkBusy(true);
+    try {
+      const ids = [...selectedIds];
+      const res = await fetch('/api/sessions/bulk-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      if (!res.ok) {
+        console.error('bulk-delete failed:', await res.text());
+        setConfirmBulkDelete(false);
+        return;
+      }
+      setConfirmBulkDelete(false);
+      setSelectedIds(new Set());
+      reload();
+    } finally {
+      setBulkBusy(false);
+    }
+  };
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
@@ -143,44 +211,92 @@ export default function Home() {
         </div>
       </header>
 
-      {/* 筛选 + 搜索 */}
-      <div className="flex flex-wrap items-center gap-2 px-6 pt-4 pb-4">
-        <div className="flex gap-1">
-          <Button
-            variant={backend === '' ? 'secondary' : 'ghost'}
-            size="sm"
-            onClick={() => setBackend('')}
-          >
-            全部
-          </Button>
-          {(Object.keys(BACKEND_LABEL) as Array<keyof typeof BACKEND_LABEL>).map(
-            (b) => (
-              <Button
-                key={b}
-                variant={backend === b ? 'secondary' : 'ghost'}
-                size="sm"
-                onClick={() => setBackend(b)}
-              >
-                {BACKEND_LABEL[b]}
-              </Button>
-            ),
-          )}
+      {/* 筛选 + 搜索 + 批量操作（sticky，滚动时仍可见） */}
+      <div className="sticky top-[65px] z-10 space-y-2 border-b bg-background/95 px-6 pt-4 pb-3 backdrop-blur supports-backdrop-filter:bg-background/80">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex gap-1">
+            <Button
+              variant={backend === '' ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => setBackend('')}
+            >
+              全部
+            </Button>
+            {(Object.keys(BACKEND_LABEL) as Array<keyof typeof BACKEND_LABEL>).map(
+              (b) => (
+                <Button
+                  key={b}
+                  variant={backend === b ? 'secondary' : 'ghost'}
+                  size="sm"
+                  onClick={() => setBackend(b)}
+                >
+                  {BACKEND_LABEL[b]}
+                </Button>
+              ),
+            )}
+          </div>
+          {/* 搜索框:左侧 Search 图标绝对定位,Input 左 padding 留出空间 */}
+          <div className="relative min-w-[200px] max-w-sm flex-1">
+            <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              type="search"
+              placeholder="搜索标题..."
+              value={qInput}
+              onChange={(e) => setQInput(e.target.value)}
+              className="pl-8"
+            />
+          </div>
         </div>
-        {/* 搜索框:左侧 Search 图标绝对定位,Input 左 padding 留出空间 */}
-        <div className="relative min-w-[200px] max-w-sm flex-1">
-          <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            type="search"
-            placeholder="搜索标题..."
-            value={qInput}
-            onChange={(e) => setQInput(e.target.value)}
-            className="pl-8"
-          />
-        </div>
+
+        {/* 多选工具条：有列表时显示；选中后强调删除 */}
+        {!loading && !error && items.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <Checkbox
+              checked={allVisibleSelected}
+              onCheckedChange={(c) => {
+                if (c) selectAllVisible();
+                else clearSelection();
+              }}
+              aria-label="全选当前列表"
+            />
+            <Button variant="ghost" size="sm" onClick={selectAllVisible}>
+              全选
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={invertSelection}
+              disabled={visibleIds.length === 0}
+            >
+              反选
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={clearSelection}
+              disabled={selectedCount === 0}
+            >
+              取消选中
+            </Button>
+            <span className="text-muted-foreground">
+              已选 {selectedCount}
+              {visibleIds.length > 0 ? ` / ${visibleIds.length}` : ''}
+            </span>
+            <Button
+              variant="destructive"
+              size="sm"
+              disabled={selectedCount === 0 || bulkBusy}
+              onClick={() => setConfirmBulkDelete(true)}
+            >
+              <Trash2 className="size-4" />
+              删除选中 ({selectedCount})
+            </Button>
+          </div>
+        )}
       </div>
 
       {/* 列表 / 空状态 / loading */}
-      <main className="min-h-0 flex-1 overflow-y-auto px-6 pb-8">
+      <main className="min-h-0 flex-1 overflow-y-auto px-6 pb-8 pt-4">
         {error ? (
           <ErrorBanner message={error} onRetry={reload} retrying={loading} />
         ) : loading ? (
@@ -212,7 +328,13 @@ export default function Home() {
                 </h3>
                 <div className="space-y-0.5">
                   {groupItems.map((s) => (
-                    <SessionRow key={s.id} item={s} onChanged={reload} />
+                    <SessionRow
+                      key={s.id}
+                      item={s}
+                      onChanged={reload}
+                      selected={selectedIds.has(s.id)}
+                      onSelectedChange={(checked) => toggleOne(s.id, checked)}
+                    />
                   ))}
                 </div>
               </div>
@@ -220,17 +342,31 @@ export default function Home() {
           </div>
         )}
       </main>
+
+      <ConfirmDialog
+        open={confirmBulkDelete}
+        onOpenChange={setConfirmBulkDelete}
+        title={`删除选中的 ${selectedCount} 个会话?`}
+        description="将软删除选中会话（与单条删除相同）。历史消息保留在数据库中，列表中不再显示。此操作不可从 UI 恢复。"
+        confirmText="删除选中"
+        busy={bulkBusy}
+        onConfirm={confirmBulkDeleteAction}
+      />
     </div>
   );
 }
 
-// 单条会话行:hover 高亮、点击进会话、⋯ 菜单(重命名/删除)、删除二次确认
+// 单条会话行:多选 Checkbox + hover 高亮、点击进会话、⋯ 菜单(重命名/删除)、删除二次确认
 function SessionRow({
   item,
   onChanged,
+  selected,
+  onSelectedChange,
 }: {
   item: SessionItem;
   onChanged: () => void;
+  selected: boolean;
+  onSelectedChange: (checked: boolean) => void;
 }) {
   // 显示优先级:userTitle > title > "新会话"
   const displayTitle = item.userTitle ?? item.title ?? '新会话';
@@ -282,6 +418,19 @@ function SessionRow({
   return (
     <>
       <div className="group flex items-center justify-between gap-3 rounded-lg px-3 py-2.5 transition-colors hover:bg-muted/50">
+        {/* 多选：阻止冒泡，避免点选跳进会话 */}
+        <div
+          className="flex shrink-0 items-center"
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => e.stopPropagation()}
+        >
+          <Checkbox
+            checked={selected}
+            onCheckedChange={onSelectedChange}
+            aria-label={`选择 ${displayTitle}`}
+          />
+        </div>
+
         <Link href={`/sessions/${item.id}`} className="min-w-0 flex-1">
           {renaming ? (
             // 重命名态:inline 输入框 + 保存/取消,Enter 提交 Esc 取消

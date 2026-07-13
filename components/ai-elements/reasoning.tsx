@@ -16,8 +16,8 @@ import type { ComponentProps, ReactNode } from "react";
 import {
   createContext,
   memo,
+  use,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -27,17 +27,28 @@ import { Streamdown } from "streamdown";
 
 import { Shimmer } from "./shimmer";
 
-interface ReasoningContextValue {
+// state / actions / meta 三段式：可注入不同状态来源（URL sync、Server push 等）
+interface ReasoningState {
   isStreaming: boolean;
   isOpen: boolean;
-  setIsOpen: (open: boolean) => void;
   duration: number | undefined;
+}
+interface ReasoningActions {
+  setIsOpen: (open: boolean) => void;
+}
+interface ReasoningMeta {
+  __placeholder?: never;
+}
+interface ReasoningContextValue {
+  state: ReasoningState;
+  actions: ReasoningActions;
+  meta: ReasoningMeta;
 }
 
 const ReasoningContext = createContext<ReasoningContextValue | null>(null);
 
 export const useReasoning = () => {
-  const context = useContext(ReasoningContext);
+  const context = use(ReasoningContext);
   if (!context) {
     throw new Error("Reasoning components must be used within Reasoning");
   }
@@ -131,9 +142,13 @@ export const Reasoning = memo(
       [setIsOpen]
     );
 
-    const contextValue = useMemo(
-      () => ({ duration, isOpen, isStreaming, setIsOpen }),
-      [duration, isOpen, isStreaming, setIsOpen]
+    const contextValue = useMemo<ReasoningContextValue>(
+      () => ({
+        actions: { setIsOpen },
+        meta: {},
+        state: { duration, isOpen, isStreaming },
+      }),
+      [duration, isOpen, isStreaming, setIsOpen],
     );
 
     return (
@@ -176,7 +191,9 @@ export const ReasoningTrigger = memo(
     getThinkingMessage = defaultGetThinkingMessage,
     ...props
   }: ReasoningTriggerProps) => {
-    const { isStreaming, isOpen, duration } = useReasoning();
+    const {
+      state: { isStreaming, isOpen, duration },
+    } = useReasoning();
 
     return (
       <CollapsibleTrigger

@@ -17,19 +17,34 @@ import {
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import { ChevronsUpDownIcon } from "lucide-react";
-import type { ComponentProps } from "react";
-import { createContext, useContext, useMemo } from "react";
+import type { ComponentProps, ReactNode } from "react";
+import { createContext, use, useMemo } from "react";
 
 import { Shimmer } from "./shimmer";
 
-interface PlanContextValue {
+// state / actions / meta 三段式：未来要替换状态来源（URL/Store/Server）
+// 时只需注入同形 Context，子组件无需改动。
+interface PlanState {
   isStreaming: boolean;
+}
+interface PlanActions {
+  // 当前 Plan 没有 action 暴露给子组件，预留以备扩展
+  __placeholder?: never;
+}
+interface PlanMeta {
+  // 当前没有 ref / 外部资源依赖
+  __placeholder?: never;
+}
+interface PlanContextValue {
+  state: PlanState;
+  actions: PlanActions;
+  meta: PlanMeta;
 }
 
 const PlanContext = createContext<PlanContextValue | null>(null);
 
 const usePlan = () => {
-  const context = useContext(PlanContext);
+  const context = use(PlanContext);
   if (!context) {
     throw new Error("Plan components must be used within Plan");
   }
@@ -46,7 +61,14 @@ export const Plan = ({
   children,
   ...props
 }: PlanProps) => {
-  const contextValue = useMemo(() => ({ isStreaming }), [isStreaming]);
+  const contextValue = useMemo<PlanContextValue>(
+    () => ({
+      actions: {},
+      meta: {},
+      state: { isStreaming },
+    }),
+    [isStreaming],
+  );
 
   return (
     <PlanContext.Provider value={contextValue}>
@@ -73,7 +95,9 @@ export type PlanTitleProps = Omit<
 };
 
 export const PlanTitle = ({ children, ...props }: PlanTitleProps) => {
-  const { isStreaming } = usePlan();
+  const {
+    state: { isStreaming },
+  } = usePlan();
 
   return (
     <CardTitle data-slot="plan-title" {...props}>
@@ -94,7 +118,9 @@ export const PlanDescription = ({
   children,
   ...props
 }: PlanDescriptionProps) => {
-  const { isStreaming } = usePlan();
+  const {
+    state: { isStreaming },
+  } = usePlan();
 
   return (
     <CardDescription
@@ -102,7 +128,8 @@ export const PlanDescription = ({
       data-slot="plan-description"
       {...props}
     >
-      {isStreaming ? <Shimmer>{children}</Shimmer> : children}
+      {/* Shimmer 默认渲染为 <p>，而 CardDescription 本身是 <p>，嵌套会触发 validateDOMNesting + 水合错误；改为 <span> */}
+      {isStreaming ? <Shimmer as="span">{children}</Shimmer> : children}
     </CardDescription>
   );
 };
@@ -125,8 +152,27 @@ export const PlanFooter = (props: PlanFooterProps) => (
   <CardFooter data-slot="plan-footer" {...props} />
 );
 
-export type PlanTriggerProps = ComponentProps<typeof CollapsibleTrigger>;
+export type PlanTriggerProps = ComponentProps<typeof CollapsibleTrigger> & {
+  /**
+   * 自定义图标。缺省为 ChevronsUpDownIcon。
+   * 通过 children 覆盖可以让调用方选择不同的视觉或加动画。
+   */
+  children?: ReactNode;
+};
 
-export const PlanTrigger = ({ className, ...props }: PlanTriggerProps) => (
-  <CollapsibleTrigger render={<Button className={cn("size-8", className)} data-slot="plan-trigger" size="icon" variant="ghost" {...props} />}><ChevronsUpDownIcon className="size-4" /><span className="sr-only">Toggle plan</span></CollapsibleTrigger>
+export const PlanTrigger = ({ className, children, ...props }: PlanTriggerProps) => (
+  <CollapsibleTrigger
+    {...props}
+    render={
+      <Button
+        className={cn("size-8", className)}
+        data-slot="plan-trigger"
+        size="icon"
+        variant="ghost"
+      />
+    }
+  >
+    {children ?? <ChevronsUpDownIcon className="size-4" />}
+    <span className="sr-only">Toggle plan</span>
+  </CollapsibleTrigger>
 );

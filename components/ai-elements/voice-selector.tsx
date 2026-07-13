@@ -33,7 +33,7 @@ import {
   VenusIcon,
 } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
-import { createContext, useCallback, useContext, useMemo } from "react";
+import { createContext, use, useCallback, useMemo } from "react";
 
 interface VoiceSelectorContextValue {
   value: string | undefined;
@@ -47,7 +47,7 @@ const VoiceSelectorContext = createContext<VoiceSelectorContextValue | null>(
 );
 
 export const useVoiceSelector = () => {
-  const context = useContext(VoiceSelectorContext);
+  const context = use(VoiceSelectorContext);
   if (!context) {
     throw new Error(
       "VoiceSelector components must be used within VoiceSelector"
@@ -80,7 +80,11 @@ export const VoiceSelector = ({
 
   const [open, setOpen] = useControllableState({
     defaultProp: defaultOpen,
-    onChange: onOpenChange,
+    onChange: (next) => {
+      // base-ui Dialog's onOpenChange has 2 args (open, eventDetails);
+      // useControllableState only passes the value, so we narrow the call here.
+      (onOpenChange as unknown as ((value: boolean) => void) | undefined)?.(next);
+    },
     prop: openProp,
   });
 

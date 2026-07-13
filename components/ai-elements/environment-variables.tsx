@@ -8,8 +8,8 @@ import { CheckIcon, CopyIcon, EyeIcon, EyeOffIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes } from "react";
 import {
   createContext,
+  use,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -21,15 +21,19 @@ interface EnvironmentVariablesContextType {
   setShowValues: (show: boolean) => void;
 }
 
-// Default noop for context default value
-// oxlint-disable-next-line eslint(no-empty-function)
-const noop = () => {};
-
+// null + throw 模式：未在 Provider 内使用子组件立即暴露，而不是静默吞掉 noop
 const EnvironmentVariablesContext =
-  createContext<EnvironmentVariablesContextType>({
-    setShowValues: noop,
-    showValues: false,
-  });
+  createContext<EnvironmentVariablesContextType | null>(null);
+
+const useEnvironmentVariables = () => {
+  const ctx = use(EnvironmentVariablesContext);
+  if (!ctx) {
+    throw new Error(
+      "EnvironmentVariables components must be used within EnvironmentVariables"
+    );
+  }
+  return ctx;
+};
 
 export type EnvironmentVariablesProps = HTMLAttributes<HTMLDivElement> & {
   showValues?: boolean;
@@ -110,7 +114,7 @@ export const EnvironmentVariablesToggle = ({
   className,
   ...props
 }: EnvironmentVariablesToggleProps) => {
-  const { showValues, setShowValues } = useContext(EnvironmentVariablesContext);
+  const { showValues, setShowValues } = useEnvironmentVariables();
 
   return (
     <div className={cn("flex items-center gap-2", className)}>
@@ -145,10 +149,17 @@ interface EnvironmentVariableContextType {
 }
 
 const EnvironmentVariableContext =
-  createContext<EnvironmentVariableContextType>({
-    name: "",
-    value: "",
-  });
+  createContext<EnvironmentVariableContextType | null>(null);
+
+const useEnvironmentVariable = () => {
+  const ctx = use(EnvironmentVariableContext);
+  if (!ctx) {
+    throw new Error(
+      "EnvironmentVariable components must be used within EnvironmentVariable"
+    );
+  }
+  return ctx;
+};
 
 export type EnvironmentVariableGroupProps = HTMLAttributes<HTMLDivElement>;
 
@@ -169,7 +180,7 @@ export const EnvironmentVariableName = ({
   children,
   ...props
 }: EnvironmentVariableNameProps) => {
-  const { name } = useContext(EnvironmentVariableContext);
+  const { name } = useEnvironmentVariable();
 
   return (
     <span className={cn("font-mono text-sm", className)} {...props}>
@@ -185,8 +196,8 @@ export const EnvironmentVariableValue = ({
   children,
   ...props
 }: EnvironmentVariableValueProps) => {
-  const { value } = useContext(EnvironmentVariableContext);
-  const { showValues } = useContext(EnvironmentVariablesContext);
+  const { value } = useEnvironmentVariable();
+  const { showValues } = useEnvironmentVariables();
 
   const displayValue = showValues
     ? value
@@ -262,7 +273,7 @@ export const EnvironmentVariableCopyButton = ({
 }: EnvironmentVariableCopyButtonProps) => {
   const [isCopied, setIsCopied] = useState(false);
   const timeoutRef = useRef<number>(0);
-  const { name, value } = useContext(EnvironmentVariableContext);
+  const { name, value } = useEnvironmentVariable();
 
   const getTextToCopy = useCallback((): string => {
     const formatMap = {

@@ -15,8 +15,8 @@ import {
 import type { HTMLAttributes, ReactNode } from "react";
 import {
   createContext,
+  use,
   useCallback,
-  useContext,
   useMemo,
   useState,
 } from "react";
@@ -143,7 +143,7 @@ export const FileTreeFolder = ({
   ...props
 }: FileTreeFolderProps) => {
   const { expandedPaths, togglePath, selectedPath, onSelect } =
-    useContext(FileTreeContext);
+    use(FileTreeContext);
   const isExpanded = expandedPaths.has(path);
   const isSelected = selectedPath === path;
 
@@ -229,7 +229,7 @@ export const FileTreeFile = ({
   children,
   ...props
 }: FileTreeFileProps) => {
-  const { selectedPath, onSelect } = useContext(FileTreeContext);
+  const { selectedPath, onSelect } = use(FileTreeContext);
   const isSelected = selectedPath === path;
 
   const handleClick = useCallback(() => {

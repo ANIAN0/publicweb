@@ -12,10 +12,12 @@ import { cn } from "@/lib/utils";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import type { ComponentProps, CSSProperties, HTMLAttributes } from "react";
 import {
+  Children,
   createContext,
+  isValidElement,
   memo,
+  use,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -111,6 +113,10 @@ const LineSpan = ({
 type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   code: string;
   language: BundledLanguage;
+  /**
+   * @deprecated 请改用 `<CodeBlockLineNumbers />` slot。
+   * 保留 prop 是为了不破坏现有调用方；若同时传入 prop 与 slot，slot 优先。
+   */
   showLineNumbers?: boolean;
 };
 
@@ -122,11 +128,13 @@ interface TokenizedCode {
 
 interface CodeBlockContextType {
   code: string;
+  showLineNumbers: boolean;
 }
 
 // Context
 const CodeBlockContext = createContext<CodeBlockContextType>({
   code: "",
+  showLineNumbers: false,
 });
 
 // Highlighter cache (singleton per language)
@@ -308,11 +316,13 @@ export const CodeBlockContainer = ({
   ...props
 }: HTMLAttributes<HTMLDivElement> & { language: string }) => (
   <div
+    aria-label={`Code: ${language}`}
     className={cn(
       "group relative w-full overflow-hidden rounded-md border bg-background text-foreground",
       className
     )}
     data-language={language}
+    role="region"
     style={{
       containIntrinsicSize: "auto 200px",
       contentVisibility: "auto",
@@ -374,12 +384,14 @@ export const CodeBlockActions = ({
 export const CodeBlockContent = ({
   code,
   language,
-  showLineNumbers = false,
 }: {
   code: string;
   language: BundledLanguage;
-  showLineNumbers?: boolean;
 }) => {
+  // 行号开关由 CodeBlockLineNumbers slot 或 showLineNumbers prop 控制；
+  // 这里统一从 Context 读取，使两种入口行为一致。
+  const { showLineNumbers } = use(CodeBlockContext);
+
   // Memoized raw tokens for immediate display
   const rawTokens = useMemo(() => createRawTokens(code), [code]);
 
@@ -428,44 +440,66 @@ export const CodeBlockContent = ({
 export const CodeBlock = ({
   code,
   language,
-  showLineNumbers = false,
+  showLineNumbers: showLineNumbersProp = false,
   className,
   children,
   ...props
 }: CodeBlockProps) => {
-  const contextValue = useMemo(() => ({ code }), [code]);
+  // prop 形式向后兼容；slot 通过 children 结构同步推导，渲染期间无 state 更新。
+  const hasLineNumbersSlot = Children.toArray(children).some(
+    (child) => isValidElement(child) && child.type === CodeBlockLineNumbers,
+  );
+  const showLineNumbers = showLineNumbersProp || hasLineNumbersSlot;
+  const contextValue = useMemo(
+    () => ({ code, showLineNumbers }),
+    [code, showLineNumbers],
+  );
 
   return (
     <CodeBlockContext.Provider value={contextValue}>
       <CodeBlockContainer className={className} language={language} {...props}>
         {children}
-        <CodeBlockContent
-          code={code}
-          language={language}
-          showLineNumbers={showLineNumbers}
-        />
+        <CodeBlockContent code={code} language={language} />
       </CodeBlockContainer>
     </CodeBlockContext.Provider>
   );
+};
+
+/**
+ * 启用行号渲染的 slot。放在 CodeBlock 任意子位置都会生效，无需 prop。
+ * 用法：
+ *   <CodeBlock code={...} language="ts">
+ *     <CodeBlockLineNumbers />
+ *     <CodeBlockCopyButton />
+ *   </CodeBlock>
+ */
+export const CodeBlockLineNumbers = () => {
+  return null;
 };
 
 export type CodeBlockCopyButtonProps = ComponentProps<typeof Button> & {
   onCopy?: () => void;
   onError?: (error: Error) => void;
   timeout?: number;
+  /** 自定义无障碍标签；默认根据复制状态切换"复制代码 / 已复制" */
+  copyLabel?: string;
+  copiedLabel?: string;
 };
 
 export const CodeBlockCopyButton = ({
   onCopy,
   onError,
   timeout = 2000,
+  copyLabel = "复制代码",
+  copiedLabel = "已复制",
   children,
   className,
+  "aria-label": ariaLabelProp,
   ...props
 }: CodeBlockCopyButtonProps) => {
   const [isCopied, setIsCopied] = useState(false);
   const timeoutRef = useRef<number>(0);
-  const { code } = useContext(CodeBlockContext);
+  const { code } = use(CodeBlockContext);
 
   const copyToClipboard = useCallback(async () => {
     if (typeof window === "undefined" || !navigator?.clipboard?.writeText) {
@@ -496,16 +530,19 @@ export const CodeBlockCopyButton = ({
   );
 
   const Icon = isCopied ? CheckIcon : CopyIcon;
+  const label = isCopied ? copiedLabel : copyLabel;
 
   return (
     <Button
+      aria-label={ariaLabelProp ?? label}
       className={cn("shrink-0", className)}
       onClick={copyToClipboard}
       size="icon"
       variant="ghost"
       {...props}
     >
-      {children ?? <Icon size={14} />}
+      {children ?? <Icon size={14} aria-hidden="true" />}
+      <span className="sr-only">{label}</span>
     </Button>
   );
 };

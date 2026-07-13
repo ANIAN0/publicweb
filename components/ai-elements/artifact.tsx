@@ -126,8 +126,24 @@ export const ArtifactAction = ({
     return (
       <TooltipProvider>
         <Tooltip>
-          {/* Base UI：render 合并为单一 button，避免嵌套 button 导致 hydration 错误 */}
-          <TooltipTrigger render={button} />
+          {/* Base UI render 模式合并触发器，避免 TooltipTrigger 默认渲染的 <button> 包裹内部 <Button>，消除嵌套 button + 水合错误 */}
+          <TooltipTrigger
+            render={
+              <Button
+                className={cn(
+                  "size-8 p-0 text-muted-foreground hover:text-foreground",
+                  className
+                )}
+                size={size}
+                type="button"
+                variant={variant}
+                {...props}
+              />
+            }
+          >
+            {Icon ? <Icon className="size-4" /> : children}
+            <span className="sr-only">{label || tooltip}</span>
+          </TooltipTrigger>
           <TooltipContent>
             <p>{tooltip}</p>
           </TooltipContent>

@@ -51,7 +51,6 @@ import {
 } from "lucide-react";
 import { nanoid } from "nanoid";
 import type {
-  ChangeEvent,
   ChangeEventHandler,
   ClipboardEventHandler,
   ComponentProps,
@@ -59,17 +58,15 @@ import type {
   FormEventHandler,
   HTMLAttributes,
   KeyboardEventHandler,
-  MutableRefObject,
   PropsWithChildren,
   ReactNode,
-  Ref,
   RefObject,
 } from "react";
 import {
   Children,
   createContext,
+  use,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -198,7 +195,7 @@ export interface TextInputContext {
 export interface PromptInputControllerProps {
   textInput: TextInputContext;
   attachments: AttachmentsContext;
-  /** INTERNAL: Allows PromptInput to register its file textInput + "open" callback */
+  /** INTERNAL: Allows LiftedPromptInput to register its file input + "open" callback */
   __registerFileInput: (
     ref: RefObject<HTMLInputElement | null>,
     open: () => void
@@ -213,7 +210,7 @@ const ProviderAttachmentsContext = createContext<AttachmentsContext | null>(
 );
 
 export const usePromptInputController = () => {
-  const ctx = useContext(PromptInputController);
+  const ctx = use(PromptInputController);
   if (!ctx) {
     throw new Error(
       "Wrap your component inside <PromptInputProvider> to use usePromptInputController()."
@@ -222,12 +219,8 @@ export const usePromptInputController = () => {
   return ctx;
 };
 
-// Optional variants (do NOT throw). Useful for dual-mode components.
-const useOptionalPromptInputController = () =>
-  useContext(PromptInputController);
-
 export const useProviderAttachments = () => {
-  const ctx = useContext(ProviderAttachmentsContext);
+  const ctx = use(ProviderAttachmentsContext);
   if (!ctx) {
     throw new Error(
       "Wrap your component inside <PromptInputProvider> to use useProviderAttachments()."
@@ -237,7 +230,7 @@ export const useProviderAttachments = () => {
 };
 
 const useOptionalProviderAttachments = () =>
-  useContext(ProviderAttachmentsContext);
+  use(ProviderAttachmentsContext);
 
 export type PromptInputProviderProps = PropsWithChildren<{
   initialInput?: string;
@@ -374,9 +367,10 @@ export const PromptInputProvider = ({
 const LocalAttachmentsContext = createContext<AttachmentsContext | null>(null);
 
 export const usePromptInputAttachments = () => {
-  // Prefer local context (inside PromptInput) as it has validation, fall back to provider
+  // Standalone PromptInput 始终提供 LocalAttachmentsContext；Provider 场景下
+  // 也允许使用（PromptInputProvider 仍暴露 ProviderAttachmentsContext）。
+  const local = use(LocalAttachmentsContext);
   const provider = useOptionalProviderAttachments();
-  const local = useContext(LocalAttachmentsContext);
   const context = local ?? provider;
   if (!context) {
     throw new Error(
@@ -401,7 +395,7 @@ export const LocalReferencedSourcesContext =
   createContext<ReferencedSourcesContext | null>(null);
 
 export const usePromptInputReferencedSources = () => {
-  const ctx = useContext(LocalReferencedSourcesContext);
+  const ctx = use(LocalReferencedSourcesContext);
   if (!ctx) {
     throw new Error(
       "usePromptInputReferencedSources must be used within a LocalReferencedSourcesContext.Provider"
@@ -514,7 +508,7 @@ export type PromptInputProps = Omit<
   onSubmit: (
     message: PromptInputMessage,
     event: FormEvent<HTMLFormElement>
-  ) => boolean | void | Promise<boolean | void>;
+  ) => void | Promise<void>;
 };
 
 export const PromptInput = ({
@@ -530,31 +524,29 @@ export const PromptInput = ({
   children,
   ...props
 }: PromptInputProps) => {
-  // Try to use a provider controller if present
-  const controller = useOptionalPromptInputController();
-  const usingProvider = !!controller;
+  // Standalone 变体：所有状态由本组件管理，不感知 Provider 是否存在。
+  // 如需把状态上提到父级，请使用 PromptInputProvider + 自定义 children 模式。
 
   // Refs
   const inputRef = useRef<HTMLInputElement | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
 
-  // ----- Local attachments (only used when no provider)
+  // ----- Local attachments
   const [items, setItems] = useState<(FileUIPart & { id: string })[]>([]);
-  const files = usingProvider ? controller.attachments.files : items;
 
-  // ----- Local referenced sources (always local to PromptInput)
+  // ----- Local referenced sources
   const [referencedSources, setReferencedSources] = useState<
     (SourceDocumentUIPart & { id: string })[]
   >([]);
 
   // Keep a ref to files for cleanup on unmount (avoids stale closure)
-  const filesRef = useRef(files);
+  const filesRef = useRef(items);
 
   useEffect(() => {
-    filesRef.current = files;
-  }, [files]);
+    filesRef.current = items;
+  }, [items]);
 
-  const openFileDialogLocal = useCallback(() => {
+  const openFileDialog = useCallback(() => {
     inputRef.current?.click();
   }, []);
 
@@ -581,7 +573,7 @@ export const PromptInput = ({
     [accept]
   );
 
-  const addLocal = useCallback(
+  const add = useCallback(
     (fileList: File[] | FileList) => {
       const incoming = [...fileList];
       const accepted = incoming.filter((f) => matchesAccept(f));
@@ -632,108 +624,44 @@ export const PromptInput = ({
     [matchesAccept, maxFiles, maxFileSize, onError]
   );
 
-  const removeLocal = useCallback(
-    (id: string) =>
-      setItems((prev) => {
-        const found = prev.find((file) => file.id === id);
-        if (found?.url) {
-          URL.revokeObjectURL(found.url);
+  const remove = useCallback((id: string) => {
+    setItems((prev) => {
+      const found = prev.find((file) => file.id === id);
+      if (found?.url) {
+        URL.revokeObjectURL(found.url);
+      }
+      return prev.filter((file) => file.id !== id);
+    });
+  }, []);
+
+  const clearAttachments = useCallback(() => {
+    setItems((prev) => {
+      for (const file of prev) {
+        if (file.url) {
+          URL.revokeObjectURL(file.url);
         }
-        return prev.filter((file) => file.id !== id);
-      }),
-    []
-  );
-
-  // Wrapper that validates files before calling provider's add
-  const addWithProviderValidation = useCallback(
-    (fileList: File[] | FileList) => {
-      const incoming = [...fileList];
-      const accepted = incoming.filter((f) => matchesAccept(f));
-      if (incoming.length && accepted.length === 0) {
-        onError?.({
-          code: "accept",
-          message: "No files match the accepted types.",
-        });
-        return;
       }
-      const withinSize = (f: File) =>
-        maxFileSize ? f.size <= maxFileSize : true;
-      const sized = accepted.filter(withinSize);
-      if (accepted.length > 0 && sized.length === 0) {
-        onError?.({
-          code: "max_file_size",
-          message: "All files exceed the maximum size.",
-        });
-        return;
-      }
-
-      const currentCount = files.length;
-      const capacity =
-        typeof maxFiles === "number"
-          ? Math.max(0, maxFiles - currentCount)
-          : undefined;
-      const capped =
-        typeof capacity === "number" ? sized.slice(0, capacity) : sized;
-      if (typeof capacity === "number" && sized.length > capacity) {
-        onError?.({
-          code: "max_files",
-          message: "Too many files. Some were not added.",
-        });
-      }
-
-      if (capped.length > 0) {
-        controller?.attachments.add(capped);
-      }
-    },
-    [matchesAccept, maxFileSize, maxFiles, onError, files.length, controller]
-  );
-
-  const clearAttachments = useCallback(
-    () =>
-      usingProvider
-        ? controller?.attachments.clear()
-        : setItems((prev) => {
-            for (const file of prev) {
-              if (file.url) {
-                URL.revokeObjectURL(file.url);
-              }
-            }
-            return [];
-          }),
-    [usingProvider, controller]
-  );
+      return [];
+    });
+  }, []);
 
   const clearReferencedSources = useCallback(
     () => setReferencedSources([]),
     []
   );
 
-  const add = usingProvider ? addWithProviderValidation : addLocal;
-  const remove = usingProvider ? controller.attachments.remove : removeLocal;
-  const openFileDialog = usingProvider
-    ? controller.attachments.openFileDialog
-    : openFileDialogLocal;
-
   const clear = useCallback(() => {
     clearAttachments();
     clearReferencedSources();
   }, [clearAttachments, clearReferencedSources]);
 
-  // Let provider know about our hidden file input so external menus can call openFileDialog()
-  useEffect(() => {
-    if (!usingProvider) {
-      return;
-    }
-    controller.__registerFileInput(inputRef, () => inputRef.current?.click());
-  }, [usingProvider, controller]);
-
   // Note: File input cannot be programmatically set for security reasons
   // The syncHiddenInput prop is no longer functional
   useEffect(() => {
-    if (syncHiddenInput && inputRef.current && files.length === 0) {
+    if (syncHiddenInput && inputRef.current && items.length === 0) {
       inputRef.current.value = "";
     }
-  }, [files, syncHiddenInput]);
+  }, [items, syncHiddenInput]);
 
   // Attach drop handlers on nearest form and document (opt-in)
   useEffect(() => {
@@ -795,15 +723,14 @@ export const PromptInput = ({
 
   useEffect(
     () => () => {
-      if (!usingProvider) {
-        for (const f of filesRef.current) {
-          if (f.url) {
-            URL.revokeObjectURL(f.url);
-          }
+      // Standalone 模式：本地 blob URL 在卸载时回收
+      for (const f of filesRef.current) {
+        if (f.url) {
+          URL.revokeObjectURL(f.url);
         }
       }
     },
-    [usingProvider]
+    []
   );
 
   const handleChange: ChangeEventHandler<HTMLInputElement> = useCallback(
@@ -822,11 +749,11 @@ export const PromptInput = ({
       add,
       clear: clearAttachments,
       fileInputRef: inputRef,
-      files: files.map((item) => ({ ...item, id: item.id })),
+      files: items.map((item) => ({ ...item, id: item.id })),
       openFileDialog,
       remove,
     }),
-    [files, add, remove, clearAttachments, openFileDialog]
+    [items, add, remove, clearAttachments, openFileDialog]
   );
 
   const refsCtx = useMemo<ReferencedSourcesContext>(
@@ -852,23 +779,17 @@ export const PromptInput = ({
       event.preventDefault();
 
       const form = event.currentTarget;
-      const text = usingProvider
-        ? controller.textInput.value
-        : (() => {
-            const formData = new FormData(form);
-            return (formData.get("message") as string) || "";
-          })();
+      const formData = new FormData(form);
+      const text = (formData.get("message") as string) || "";
 
       // Reset form immediately after capturing text to avoid race condition
       // where user input during async blob conversion would be lost
-      if (!usingProvider) {
-        form.reset();
-      }
+      form.reset();
 
       try {
         // Convert blob URLs to data URLs asynchronously
         const convertedFiles: FileUIPart[] = await Promise.all(
-          files.map(async ({ id: _id, ...item }) => {
+          items.map(async ({ id: _id, ...item }) => {
             if (item.url?.startsWith("blob:")) {
               const dataUrl = await convertBlobUrlToDataUrl(item.url);
               // If conversion failed, keep the original blob URL
@@ -881,20 +802,25 @@ export const PromptInput = ({
           })
         );
 
-        const submitted = await onSubmit({ files: convertedFiles, text }, event);
+        const result = onSubmit({ files: convertedFiles, text }, event);
 
-        // `false` means the caller deliberately kept the draft for retry.
-        if (submitted !== false) {
-          clear();
-          if (usingProvider) {
-            controller.textInput.clear();
+        // Handle both sync and async onSubmit
+        if (result instanceof Promise) {
+          try {
+            await result;
+            clear();
+          } catch {
+            // Don't clear on error - user may want to retry
           }
+        } else {
+          // Sync function completed without throwing, clear inputs
+          clear();
         }
       } catch {
         // Don't clear on error - user may want to retry
       }
     },
-    [usingProvider, controller, files, onSubmit, clear]
+    [items, onSubmit, clear]
   );
 
   // Render with or without local provider
@@ -953,35 +879,10 @@ export const PromptInputTextarea = ({
   onKeyDown,
   className,
   placeholder = "What would you like to know?",
-  autoFocus,  // T-012:ready 时 rAF focus
-  ref, // React 19：ref 作 prop；PAGE-001/COMP-011 用 ref 绑焦点，禁止 querySelector
   ...props
-}: PromptInputTextareaProps & {
-  autoFocus?: boolean;
-  ref?: Ref<HTMLTextAreaElement>;
-}) => {
-  const controller = useOptionalPromptInputController();
+}: PromptInputTextareaProps) => {
   const attachments = usePromptInputAttachments();
   const [isComposing, setIsComposing] = useState(false);
-  // 内部 ref：autoFocus 与外部 ref 合并
-  const localRef = useRef<HTMLTextAreaElement | null>(null);
-  const setTextareaRef = useCallback(
-    (node: HTMLTextAreaElement | null) => {
-      localRef.current = node;
-      if (typeof ref === "function") ref(node);
-      else if (ref) (ref as MutableRefObject<HTMLTextAreaElement | null>).current = node;
-    },
-    [ref],
-  );
-  // T-012:ready 时 rAF focus 本组件 textarea（对齐 template；COMP-011 不用全局 querySelector）
-  useEffect(() => {
-    if (autoFocus) {
-      const id = requestAnimationFrame(() => {
-        localRef.current?.focus();
-      });
-      return () => cancelAnimationFrame(id);
-    }
-  }, [autoFocus]);
 
   const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = useCallback(
     (e) => {
@@ -1060,30 +961,17 @@ export const PromptInputTextarea = ({
   const handleCompositionEnd = useCallback(() => setIsComposing(false), []);
   const handleCompositionStart = useCallback(() => setIsComposing(true), []);
 
-  const controlledProps = controller
-    ? {
-        onChange: (e: ChangeEvent<HTMLTextAreaElement>) => {
-          controller.textInput.setInput(e.currentTarget.value);
-          onChange?.(e);
-        },
-        value: controller.textInput.value,
-      }
-    : {
-        onChange,
-      };
-
   return (
     <InputGroupTextarea
-      ref={setTextareaRef}
       className={cn("field-sizing-content max-h-48 min-h-16", className)}
       name="message"
+      onChange={onChange}
       onCompositionEnd={handleCompositionEnd}
       onCompositionStart={handleCompositionStart}
       onKeyDown={handleKeyDown}
       onPaste={handlePaste}
       placeholder={placeholder}
       {...props}
-      {...controlledProps}
     />
   );
 };
@@ -1108,12 +996,13 @@ export type PromptInputFooterProps = Omit<
   ComponentProps<typeof InputGroupAddon>,
   "align"
 > & {
-  footerStart?: ReactNode;  // T-012:左侧槽位(预留附件/工具按钮位)
+  /** @deprecated 直接把工具区作为 children 传入。 */
+  footerStart?: ReactNode;
 };
 
 export const PromptInputFooter = ({
   className,
-  footerStart,  // T-012
+  footerStart,
   children,
   ...props
 }: PromptInputFooterProps) => (
@@ -1156,23 +1045,28 @@ export const PromptInputButton = ({
   className,
   size,
   tooltip,
+  children,
   ...props
 }: PromptInputButtonProps) => {
   const newSize =
-    size ?? (Children.count(props.children) > 1 ? "sm" : "icon-sm");
+    size ?? (Children.count(children) > 1 ? "sm" : "icon-sm");
 
-  const button = (
-    <InputGroupButton
-      className={cn(className)}
-      size={newSize}
-      type="button"
-      variant={variant}
-      {...props}
-    />
-  );
+  // render 模式需要 InputGroupButton JSX 不携带 children，由 TooltipTrigger children 注入；
+  // 因此从 props 中分离 children，两个分支显式注入，避免重复或缺失。
+  const buttonProps = {
+    className: cn(className),
+    size: newSize,
+    type: "button" as const,
+    variant,
+    ...props,
+  };
 
   if (!tooltip) {
-    return button;
+    return (
+      <InputGroupButton {...buttonProps}>
+        {children}
+      </InputGroupButton>
+    );
   }
 
   const tooltipContent =
@@ -1182,8 +1076,10 @@ export const PromptInputButton = ({
 
   return (
     <Tooltip>
-      {/* Base UI：render 合并触发元素，避免 button 嵌套 button / hydration 失败 */}
-      <TooltipTrigger render={button} />
+      {/* Base UI render 模式合并触发器，避免 TooltipTrigger 默认渲染的 <button> 包裹内部 <InputGroupButton>，消除嵌套 button + 水合错误 */}
+      <TooltipTrigger render={<InputGroupButton {...buttonProps} />}>
+        {children}
+      </TooltipTrigger>
       <TooltipContent side={side}>
         {tooltipContent}
         {shortcut && (
@@ -1235,7 +1131,8 @@ export const PromptInputActionMenuItem = ({
 export type PromptInputSubmitProps = ComponentProps<typeof InputGroupButton> & {
   status?: ChatStatus;
   onStop?: () => void;
-  disabledReason?: string;  // T-012:disabled 时 title 提示禁用原因
+  /** 禁用原因；保留为原生 title，兼容既有调用方。 */
+  disabledReason?: string;
 };
 
 export const PromptInputSubmit = ({
@@ -1246,7 +1143,7 @@ export const PromptInputSubmit = ({
   onStop,
   onClick,
   children,
-  disabledReason,  // T-012
+  disabledReason,
   ...props
 }: PromptInputSubmitProps) => {
   const isGenerating = status === "submitted" || status === "streaming";
@@ -1261,12 +1158,8 @@ export const PromptInputSubmit = ({
     Icon = <XIcon className="size-4" />;
   }
 
-  type SubmitClickEvent = Parameters<
-    NonNullable<ComponentProps<typeof InputGroupButton>["onClick"]>
-  >[0];
-
   const handleClick = useCallback(
-    (e: SubmitClickEvent) => {
+    (e: Parameters<NonNullable<PromptInputSubmitProps["onClick"]>>[0]) => {
       if (isGenerating && onStop) {
         e.preventDefault();
         onStop();
@@ -1283,7 +1176,7 @@ export const PromptInputSubmit = ({
       className={cn(className)}
       onClick={handleClick}
       size={size}
-      title={disabledReason}  // T-012:disabled 时 title 提示禁用原因(原生 tooltip)
+      title={disabledReason}
       type={isGenerating && onStop ? "button" : "submit"}
       variant={variant}
       {...props}
@@ -1348,7 +1241,9 @@ export const PromptInputSelectValue = ({
 
 export type PromptInputHoverCardProps = ComponentProps<typeof HoverCard>;
 
-export const PromptInputHoverCard = (props: PromptInputHoverCardProps) => (
+export const PromptInputHoverCard = ({
+  ...props
+}: PromptInputHoverCardProps) => (
   <HoverCard {...props} />
 );
 

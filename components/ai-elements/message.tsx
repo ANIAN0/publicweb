@@ -8,6 +8,7 @@ import {
 import {
   Tooltip,
   TooltipContent,
+  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -21,8 +22,8 @@ import type { ComponentProps, HTMLAttributes, ReactElement } from "react";
 import {
   createContext,
   memo,
+  use,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useState,
@@ -97,29 +98,47 @@ export const MessageAction = ({
   );
 
   if (tooltip) {
-    // COMP-010：不在每个 Action 包 TooltipProvider；依赖页面/MessageActions 外层 Provider
-    // （session page / MessageMeta 祖先已有 TooltipProvider；无则 Tooltip 仍可降级渲染）
-    // Base UI：render 合并为单一 button，禁止 <TooltipTrigger><Button/></TooltipTrigger> 双层 button
     return (
-      <Tooltip>
-        <TooltipTrigger render={button} />
-        <TooltipContent>
-          <p>{tooltip}</p>
-        </TooltipContent>
-      </Tooltip>
+      <TooltipProvider>
+        <Tooltip>
+          {/* Base UI render 模式合并触发器，避免 TooltipTrigger 默认渲染的 <button> 包裹内部 <Button>，消除嵌套 button + 水合错误 */}
+          <TooltipTrigger
+            render={
+              <Button size={size} type="button" variant={variant} {...props} />
+            }
+          >
+            {children}
+            <span className="sr-only">{label || tooltip}</span>
+          </TooltipTrigger>
+          <TooltipContent>
+            <p>{tooltip}</p>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
     );
   }
 
   return button;
 };
 
-interface MessageBranchContextType {
-  currentBranch: number;
-  totalBranches: number;
+// state / actions / meta 三段式：可注入 URL 同步、Server-driven 等状态源
+interface MessageBranchState {
+  current: number;
+  total: number;
+  branches: ReactElement[];
+}
+interface MessageBranchActions {
   goToPrevious: () => void;
   goToNext: () => void;
-  branches: ReactElement[];
   setBranches: (branches: ReactElement[]) => void;
+}
+interface MessageBranchMeta {
+  __placeholder?: never;
+}
+interface MessageBranchContextType {
+  state: MessageBranchState;
+  actions: MessageBranchActions;
+  meta: MessageBranchMeta;
 }
 
 const MessageBranchContext = createContext<MessageBranchContextType | null>(
@@ -127,7 +146,7 @@ const MessageBranchContext = createContext<MessageBranchContextType | null>(
 );
 
 const useMessageBranch = () => {
-  const context = useContext(MessageBranchContext);
+  const context = use(MessageBranchContext);
 
   if (!context) {
     throw new Error(
@@ -174,22 +193,20 @@ export const MessageBranch = ({
 
   const contextValue = useMemo<MessageBranchContextType>(
     () => ({
-      branches,
-      currentBranch,
-      goToNext,
-      goToPrevious,
-      setBranches,
-      totalBranches: branches.length,
+      actions: { goToNext, goToPrevious, setBranches },
+      meta: {},
+      state: {
+        branches,
+        current: currentBranch,
+        total: branches.length,
+      },
     }),
     [branches, currentBranch, goToNext, goToPrevious]
   );
 
   return (
     <MessageBranchContext.Provider value={contextValue}>
-      <div
-        className={cn("grid w-full gap-2 [&>div]:pb-0", className)}
-        {...props}
-      />
+      <div className={cn("grid w-full gap-2", className)} {...props} />
     </MessageBranchContext.Provider>
   );
 };
@@ -200,31 +217,42 @@ export const MessageBranchContent = ({
   children,
   ...props
 }: MessageBranchContentProps) => {
-  const { currentBranch, setBranches, branches } = useMessageBranch();
+  const {
+    actions: { setBranches },
+    state: { current: currentBranch },
+  } = useMessageBranch();
   const childrenArray = useMemo(
-    () => (Array.isArray(children) ? children : [children]),
+    () =>
+      (Array.isArray(children) ? children : [children]).filter(
+        Boolean,
+      ) as ReactElement[],
     [children]
   );
 
-  // Use useEffect to update branches when they change
+  // 把 children 同步到父级 state，让 selector/previous/next 等组件拿到正确总数
+  // useEffect 异步同步可接受：用户首帧已能看见当前分支（childrenArray 直接读 prop）
   useEffect(() => {
-    if (branches.length !== childrenArray.length) {
-      setBranches(childrenArray);
-    }
-  }, [childrenArray, branches, setBranches]);
+    setBranches(childrenArray);
+  }, [childrenArray, setBranches]);
 
-  return childrenArray.map((branch, index) => (
+  // 只渲染当前分支：避免 hidden DOM 重量 + 屏读器读到非可见分支
+  if (childrenArray.length === 0) return null;
+  const activeIndex = Math.min(
+    Math.max(currentBranch, 0),
+    childrenArray.length - 1,
+  );
+  const activeBranch = childrenArray[activeIndex];
+  if (!activeBranch) return null;
+
+  return (
     <div
-      className={cn(
-        "grid gap-2 overflow-hidden [&>div]:pb-0",
-        index === currentBranch ? "block" : "hidden"
-      )}
-      key={branch.key}
+      className="grid gap-2 overflow-hidden"
+      key={activeBranch.key}
       {...props}
     >
-      {branch}
+      {activeBranch}
     </div>
-  ));
+  );
 };
 
 export type MessageBranchSelectorProps = ComponentProps<typeof ButtonGroup>;
@@ -233,7 +261,9 @@ export const MessageBranchSelector = ({
   className,
   ...props
 }: MessageBranchSelectorProps) => {
-  const { totalBranches } = useMessageBranch();
+  const {
+    state: { total: totalBranches },
+  } = useMessageBranch();
 
   // Don't render if there's only one branch
   if (totalBranches <= 1) {
@@ -258,7 +288,10 @@ export const MessageBranchPrevious = ({
   children,
   ...props
 }: MessageBranchPreviousProps) => {
-  const { goToPrevious, totalBranches } = useMessageBranch();
+  const {
+    actions: { goToPrevious },
+    state: { total: totalBranches },
+  } = useMessageBranch();
 
   return (
     <Button
@@ -281,7 +314,10 @@ export const MessageBranchNext = ({
   children,
   ...props
 }: MessageBranchNextProps) => {
-  const { goToNext, totalBranches } = useMessageBranch();
+  const {
+    actions: { goToNext },
+    state: { total: totalBranches },
+  } = useMessageBranch();
 
   return (
     <Button
@@ -304,7 +340,9 @@ export const MessageBranchPage = ({
   className,
   ...props
 }: MessageBranchPageProps) => {
-  const { currentBranch, totalBranches } = useMessageBranch();
+  const {
+    state: { current: currentBranch, total: totalBranches },
+  } = useMessageBranch();
 
   return (
     <ButtonGroupText
@@ -336,7 +374,8 @@ export const MessageResponse = memo(
   ),
   (prevProps, nextProps) =>
     prevProps.children === nextProps.children &&
-    nextProps.isAnimating === prevProps.isAnimating
+    prevProps.isAnimating === nextProps.isAnimating &&
+    prevProps.className === nextProps.className
 );
 
 MessageResponse.displayName = "MessageResponse";

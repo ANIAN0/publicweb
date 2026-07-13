@@ -17,8 +17,8 @@ import { ArrowLeftIcon, ArrowRightIcon } from "lucide-react";
 import type { ComponentProps } from "react";
 import {
   createContext,
+  use,
   useCallback,
-  useContext,
   useEffect,
   useState,
 } from "react";
@@ -50,7 +50,7 @@ export const InlineCitationText = ({
 export type InlineCitationCardProps = ComponentProps<typeof HoverCard>;
 
 export const InlineCitationCard = (props: InlineCitationCardProps) => (
-  <HoverCard closeDelay={0} openDelay={0} {...props} />
+  <HoverCard {...props} />
 );
 
 export type InlineCitationCardTriggerProps = ComponentProps<typeof Badge> & {
@@ -84,7 +84,7 @@ export const InlineCitationCardBody = ({
 const CarouselApiContext = createContext<CarouselApi | undefined>(undefined);
 
 const useCarouselApi = () => {
-  const context = useContext(CarouselApiContext);
+  const context = use(CarouselApiContext);
   return context;
 };
 

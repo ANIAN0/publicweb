@@ -19,8 +19,8 @@ import { ChevronsUpDownIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import {
   createContext,
+  use,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -210,7 +210,7 @@ export const MicSelectorTrigger = ({
   children,
   ...props
 }: MicSelectorTriggerProps) => {
-  const { setWidth } = useContext(MicSelectorContext);
+  const { setWidth } = use(MicSelectorContext);
   const ref = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
@@ -251,7 +251,7 @@ export const MicSelectorContent = ({
   popoverOptions,
   ...props
 }: MicSelectorContentProps) => {
-  const { width, onValueChange, value } = useContext(MicSelectorContext);
+  const { width, onValueChange, value } = use(MicSelectorContext);
 
   return (
     <PopoverContent
@@ -285,7 +285,7 @@ export const MicSelectorList = ({
   children,
   ...props
 }: MicSelectorListProps) => {
-  const { data } = useContext(MicSelectorContext);
+  const { data } = use(MicSelectorContext);
 
   return <CommandList {...props}>{children(data)}</CommandList>;
 };
@@ -300,7 +300,7 @@ export const MicSelectorEmpty = ({
 export type MicSelectorItemProps = ComponentProps<typeof CommandItem>;
 
 export const MicSelectorItem = (props: MicSelectorItemProps) => {
-  const { onValueChange, onOpenChange } = useContext(MicSelectorContext);
+  const { onValueChange, onOpenChange } = use(MicSelectorContext);
 
   const handleSelect = useCallback(
     (currentValue: string) => {
@@ -349,7 +349,7 @@ export const MicSelectorValue = ({
   className,
   ...props
 }: MicSelectorValueProps) => {
-  const { data, value } = useContext(MicSelectorContext);
+  const { data, value } = use(MicSelectorContext);
   const currentDevice = data.find((d) => d.deviceId === value);
 
   if (!currentDevice) {

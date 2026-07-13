@@ -18,7 +18,7 @@ import {
   XIcon,
 } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactNode } from "react";
-import { createContext, useCallback, useContext, useMemo } from "react";
+import { createContext, use, useCallback, useMemo } from "react";
 
 // ============================================================================
 // Types
@@ -132,10 +132,10 @@ const AttachmentContext = createContext<AttachmentContextValue | null>(null);
 // ============================================================================
 
 export const useAttachmentsContext = () =>
-  useContext(AttachmentsContext) ?? { variant: "grid" as const };
+  use(AttachmentsContext) ?? { variant: "grid" as const };
 
 export const useAttachmentContext = () => {
-  const ctx = useContext(AttachmentContext);
+  const ctx = use(AttachmentContext);
   if (!ctx) {
     throw new Error("Attachment components must be used within <Attachment>");
   }
@@ -372,11 +372,9 @@ export const AttachmentRemove = ({
 export type AttachmentHoverCardProps = ComponentProps<typeof HoverCard>;
 
 export const AttachmentHoverCard = ({
-  openDelay = 0,
-  closeDelay = 0,
   ...props
 }: AttachmentHoverCardProps) => (
-  <HoverCard closeDelay={closeDelay} openDelay={openDelay} {...props} />
+  <HoverCard {...props} />
 );
 
 export type AttachmentHoverCardTriggerProps = ComponentProps<

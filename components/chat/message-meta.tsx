@@ -2,7 +2,7 @@
 // 交互对标 DEEIX-Chat message-meta：桌面 hover/focus-within 显操作，触屏常显
 'use client';
 
-import { useCallback, useState } from 'react';
+import { memo, useCallback, useState } from 'react';
 import {
   Check,
   Copy,
@@ -17,16 +17,28 @@ import { formatPartsForExport } from '@/lib/chat/parts';
 import { cn } from '@/lib/utils';
 import { formatRelative } from '@/lib/utils';
 
+export type MessageMetaAction = 'edit' | 'resend' | 'regenerate' | 'fork';
+
 export interface MessageMetaProps {
+  messageId?: string;
   role: 'user' | 'assistant' | 'system';
   text: string;
   createdAt?: string | Date | null;
   className?: string;
   /** 是否允许编辑/重发等（发送中禁用） */
   actionsDisabled?: boolean;
+  /**
+   * A4: 单回调替代 4 个 inline 箭头，避免父组件 messages.map 内每帧新建闭包穿透到 MessageAction。
+   * 由父组件 useCallback 稳定；MessageMeta 内部按 kind+messageId 派发。
+   */
+  onAction?: (kind: MessageMetaAction, messageId: string) => void;
+  /** @deprecated 使用 messageId + onAction。 */
   onEdit?: () => void;
+  /** @deprecated 使用 messageId + onAction。 */
   onResend?: () => void;
+  /** @deprecated 使用 messageId + onAction。 */
   onRegenerate?: () => void;
+  /** @deprecated 使用 messageId + onAction。 */
   onFork?: () => void;
 }
 
@@ -42,12 +54,14 @@ export function extractMessagePlainText(
 const META_VISIBILITY_CLASS =
   'opacity-100 transition-opacity duration-150 md:pointer-events-none md:opacity-0 md:group-hover:pointer-events-auto md:group-hover:opacity-100 md:group-focus-within:pointer-events-auto md:group-focus-within:opacity-100 [@media(pointer:coarse)]:pointer-events-auto [@media(pointer:coarse)]:opacity-100';
 
-export function MessageMeta({
+export const MessageMeta = memo(function MessageMeta({
+  messageId,
   role,
   text,
   createdAt,
   className,
   actionsDisabled,
+  onAction,
   onEdit,
   onResend,
   onRegenerate,
@@ -69,8 +83,29 @@ export function MessageMeta({
     }
   }, [hasText, text]);
 
+  // A4: 单回调派发到 4 个 kind；每个 handler 仅依赖 messageId + onAction，二者稳定时 handler 也稳定
+  const handleEdit = useCallback(() => {
+    if (onAction && messageId) onAction('edit', messageId);
+    else onEdit?.();
+  }, [messageId, onAction, onEdit]);
+  const handleResend = useCallback(() => {
+    if (onAction && messageId) onAction('resend', messageId);
+    else onResend?.();
+  }, [messageId, onAction, onResend]);
+  const handleRegenerate = useCallback(() => {
+    if (onAction && messageId) onAction('regenerate', messageId);
+    else onRegenerate?.();
+  }, [messageId, onAction, onRegenerate]);
+  const handleFork = useCallback(() => {
+    if (onAction && messageId) onAction('fork', messageId);
+    else onFork?.();
+  }, [messageId, onAction, onFork]);
+
+  const hasUnifiedAction = Boolean(onAction && messageId);
+
   const hasActions =
     hasText ||
+    hasUnifiedAction ||
     onEdit ||
     onResend ||
     onRegenerate ||
@@ -108,42 +143,42 @@ export function MessageMeta({
               )}
             </MessageAction>
           )}
-          {role === 'user' && onEdit && (
+          {role === 'user' && (hasUnifiedAction || onEdit) && (
             <MessageAction
               tooltip="编辑并重发"
               label="编辑消息"
               disabled={actionsDisabled}
-              onClick={onEdit}
+              onClick={handleEdit}
             >
               <Pencil className="size-3.5" />
             </MessageAction>
           )}
-          {role === 'user' && onResend && (
+          {role === 'user' && (hasUnifiedAction || onResend) && (
             <MessageAction
               tooltip="重发"
               label="重发消息"
               disabled={actionsDisabled}
-              onClick={onResend}
+              onClick={handleResend}
             >
               <RotateCcw className="size-3.5" />
             </MessageAction>
           )}
-          {role === 'assistant' && onRegenerate && (
+          {role === 'assistant' && (hasUnifiedAction || onRegenerate) && (
             <MessageAction
               tooltip="再生成"
               label="再生成回复"
               disabled={actionsDisabled}
-              onClick={onRegenerate}
+              onClick={handleRegenerate}
             >
               <RotateCcw className="size-3.5" />
             </MessageAction>
           )}
-          {(role === 'user' || role === 'assistant') && onFork && (
+          {(role === 'user' || role === 'assistant') && (hasUnifiedAction || onFork) && (
             <MessageAction
               tooltip="从此处分支"
               label="分支会话"
               disabled={actionsDisabled}
-              onClick={onFork}
+              onClick={handleFork}
             >
               <GitFork className="size-3.5" />
             </MessageAction>
@@ -152,4 +187,4 @@ export function MessageMeta({
       </TooltipProvider>
     </div>
   );
-}
+});

@@ -1,6 +1,12 @@
 // HITL 嵌入式回答：单题 eve 形态 + 多题 claude AskUserQuestion 步进
 // 多题状态机对标 codex request_user_input：步进 / notes / 进度 / 未答确认
 // Esc / 取消 = decision cancel（禁止静默当 allow）
+//
+// 组件拆分：
+//   InputRequestActions - 入口：归一化后按 kind 分发到单/多题变体
+//   SingleHitlActions   - 单题 UI：合并步进 + freeform + 选项
+//   MultiHitlStepper    - 多题 UI：进度 + 上下题 + 未答确认
+//   AnsweredSummary     - 已回答只读摘要（两个变体共用）
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -37,23 +43,20 @@ export interface InputRequest {
   questions?: ReadonlyArray<HitlQuestion>;
 }
 
-interface InputRequestActionsProps {
-  part: PersistedPart;
-  onRespond: (response: InputResponse) => void;
-  canRespond?: boolean;
-}
-
-// 将 adapter 注入的各种形态规范成可渲染结构
-function normalizeRequest(raw: InputRequest): {
+export type HitlNormalized = {
   requestId: string;
   kind: 'single' | 'multi';
   questions: HitlQuestion[];
-} {
+};
+
+// 将 adapter 注入的各种形态规范成可渲染结构
+export function normalizeRequest(raw?: InputRequest): HitlNormalized | null {
+  if (!raw) return null;
   const requestId = raw.requestId;
   if (raw.questions && raw.questions.length > 0) {
     return {
       requestId,
-      kind: 'multi',
+      kind: raw.questions.length > 1 ? 'multi' : 'single',
       questions: raw.questions.map((q, i) => ({
         id: q.id || `q${i}`,
         question: q.question,
@@ -85,11 +88,10 @@ function normalizeRequest(raw: InputRequest): {
 // 每题本地答案：选项 id + 可选 notes
 type LocalAnswer = { optionId?: string; text?: string };
 
-export function InputRequestActions({
-  part,
-  onRespond,
-  canRespond = true,
-}: InputRequestActionsProps) {
+function readRequestFromPart(part: PersistedPart): {
+  raw: InputRequest | undefined;
+  inputResponse: InputResponse | undefined;
+} {
   const meta = (
     part as {
       toolMetadata?: {
@@ -98,35 +100,61 @@ export function InputRequestActions({
       };
     }
   ).toolMetadata;
-  const raw = meta?.inputRequest;
-  const inputResponse = meta?.inputResponse;
+  return {
+    raw: meta?.inputRequest,
+    inputResponse: meta?.inputResponse,
+  };
+}
+
+interface InputRequestActionsProps {
+  part: PersistedPart;
+  onRespond: (response: InputResponse) => void;
+  canRespond?: boolean;
+}
+
+// 入口：归一化后按 kind 显式分发到单/多题变体（消除组件内的 isMulti 分支）
+export function InputRequestActions({
+  part,
+  onRespond,
+  canRespond = true,
+}: InputRequestActionsProps) {
+  const { raw, inputResponse } = readRequestFromPart(part);
   // hooks 必须在 early return 前调用
-  const normalized = useMemo(
-    () => (raw ? normalizeRequest(raw) : null),
-    [raw]
-  );
+  const normalized = useMemo(() => normalizeRequest(raw), [raw]);
 
   if (!raw || !normalized) return null;
 
-  const { requestId, questions } = normalized;
-  const isMulti = questions.length > 1;
+  const { requestId, questions, kind } = normalized;
 
-  // —— 已回答只读 ——
+  // 已回答只读：两个变体共用同一摘要
   if (inputResponse) {
     return <AnsweredSummary questions={questions} response={inputResponse} />;
   }
 
-  // 多题 / 单题共用步进器
+  if (kind === 'multi') {
+    return (
+      <MultiHitlStepper
+        requestId={requestId}
+        questions={questions}
+        canRespond={canRespond}
+        onRespond={onRespond}
+      />
+    );
+  }
+
   return (
-    <HitlStepper
+    <SingleHitlActions
       requestId={requestId}
-      questions={questions}
-      isMulti={isMulti}
+      question={questions[0]}
       canRespond={canRespond}
       onRespond={onRespond}
     />
   );
 }
+
+// ============================================================================
+// AnsweredSummary - 已回答只读摘要（共享）
+// ============================================================================
 
 function AnsweredSummary({
   questions,
@@ -166,28 +194,178 @@ function AnsweredSummary({
   );
 }
 
-function HitlStepper({
+// ============================================================================
+// SingleHitlActions - 单题变体（无进度、无上一题、无未答确认）
+// ============================================================================
+
+// 仅 id 为 deny/reject 时一键 decision:deny（REV-006-01：禁止用 style:danger 误伤 eve 等其它危险选项）
+// adapter 仍对 optionId deny|reject 做第二道归一（T-103）
+const isDenyOption = (opt: HitlOption): boolean =>
+  opt.id === 'deny' || opt.id === 'reject';
+
+function SingleHitlActions({
+  requestId,
+  question,
+  canRespond,
+  onRespond,
+}: {
+  requestId: string;
+  question: HitlQuestion;
+  canRespond: boolean;
+  onRespond: (r: InputResponse) => void;
+}) {
+  const [optionId, setOptionId] = useState<string | undefined>();
+  const [notes, setNotes] = useState('');
+
+  const showNotes =
+    question.allowFreeform ||
+    !question.options ||
+    question.options.length === 0 ||
+    Boolean(optionId);
+
+  const submit = useCallback(() => {
+    if (!canRespond) return;
+    const t = notes.trim();
+    if (optionId) {
+      onRespond({
+        requestId,
+        decision: 'allow',
+        optionId,
+        ...(t ? { text: t } : {}),
+      });
+    } else if (t) {
+      onRespond({ requestId, decision: 'allow', text: t });
+    }
+  }, [canRespond, notes, optionId, onRespond, requestId]);
+
+  // Esc = cancel
+  const cancel = useCallback(() => {
+    if (!canRespond) return;
+    onRespond({ requestId, decision: 'cancel' });
+  }, [canRespond, onRespond, requestId]);
+
+  useEffect(() => {
+    if (!canRespond) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        cancel();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [canRespond, cancel]);
+
+  const selectOption = (id: string) => {
+    if (!canRespond) return;
+    const opt = question.options?.find((o) => o.id === id);
+    // 单题 + deny option → 直接发 decision:deny（REV-005-02）
+    if (opt && isDenyOption(opt)) {
+      onRespond({ requestId, decision: 'deny', optionId: opt.id });
+      return;
+    }
+    setOptionId(id);
+  };
+
+  return (
+    <div className="space-y-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+      <p className="text-sm text-muted-foreground whitespace-pre-wrap">{question.question}</p>
+
+      {question.options && question.options.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {question.options.map((option) => (
+            <Button
+              key={option.id}
+              disabled={!canRespond}
+              onClick={() => selectOption(option.id)}
+              variant={
+                optionId === option.id
+                  ? 'default'
+                  : option.style === 'danger'
+                    ? 'destructive'
+                    : 'outline'
+              }
+              size="sm"
+              title={option.description}
+              className={cn(optionId === option.id && 'ring-2 ring-ring')}
+            >
+              {option.label}
+            </Button>
+          ))}
+        </div>
+      )}
+
+      {showNotes && (
+        <textarea
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+          disabled={!canRespond}
+          placeholder={
+            question.options && question.options.length > 0
+              ? '补充说明（可选）…'
+              : question.isSecret
+                ? '输入回答…'
+                : '输入回答…'
+          }
+          className="min-h-16 w-full resize-none rounded-md border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+      )}
+
+      <div className="flex items-center justify-between gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          disabled={!canRespond}
+          onClick={cancel}
+          title="取消（Esc）"
+          className="text-muted-foreground"
+        >
+          取消
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          disabled={
+            !canRespond ||
+            (!optionId && !notes.trim())
+          }
+          onClick={submit}
+          className="self-end"
+        >
+          提交
+        </Button>
+      </div>
+      <p className="text-[10px] text-muted-foreground">Esc 取消 · 不会当作同意</p>
+    </div>
+  );
+}
+
+// ============================================================================
+// MultiHitlStepper - 多题变体（步进 + 进度 + 上下题 + 未答确认）
+// ============================================================================
+
+function MultiHitlStepper({
   requestId,
   questions,
-  isMulti,
   canRespond,
   onRespond,
 }: {
   requestId: string;
   questions: HitlQuestion[];
-  isMulti: boolean;
   canRespond: boolean;
   onRespond: (r: InputResponse) => void;
 }) {
-  // 仅 id 为 deny/reject 时一键 decision:deny（REV-006-01：禁止用 style:danger 误伤 eve 等其它危险选项）
-  // adapter 仍对 optionId deny|reject 做第二道归一（T-103）
-  const isDenyOption = (opt: HitlOption): boolean =>
-    opt.id === 'deny' || opt.id === 'reject';
   const [index, setIndex] = useState(0);
-  // questionId → 答案
   const [answers, setAnswers] = useState<Record<string, LocalAnswer>>({});
   const [notes, setNotes] = useState('');
-  // 未答确认面板
   const [confirmUnanswered, setConfirmUnanswered] = useState(false);
 
   const q = questions[index];
@@ -212,14 +390,7 @@ function HitlStepper({
 
   const selectOption = (optionId: string) => {
     if (!canRespond) return;
-    // REV-005-02：单题 + deny option 时直接发 decision: 'deny'（双保险；adapter 仍兜底）
-    const opt = q.options?.find((o) => o.id === optionId);
-    if (!isMulti && opt && isDenyOption(opt)) {
-      onRespond({ requestId, decision: 'deny', optionId: opt.id });
-      return;
-    }
     patchAnswer({ optionId });
-    // 选完选项：若无 freeform 且非最后一题，可自动下一步；保留 notes 区给用户补写
     setNotes(answers[q.id]?.text ?? '');
   };
 
@@ -227,7 +398,6 @@ function HitlStepper({
     const t = notes.trim();
     if (t) patchAnswer({ text: t });
     else if (answers[q.id]?.text) {
-      // 清空 notes 时保留 option
       setAnswers((prev) => {
         const next = { ...prev[q.id] };
         delete next.text;
@@ -238,7 +408,6 @@ function HitlStepper({
 
   const goNext = () => {
     commitNotesToAnswer();
-    // 同步 notes 进当前题（闭包前再写一次）
     const t = notes.trim();
     const nextAnswers = {
       ...answers,
@@ -271,21 +440,6 @@ function HitlStepper({
   const submitAll = (finalAnswers: Record<string, LocalAnswer>) => {
     if (!canRespond) return;
     setConfirmUnanswered(false);
-    // 单题：保持兼容 eve InputResponse 形状 + 显式 decision allow
-    if (questions.length === 1) {
-      const a = finalAnswers[questions[0].id] ?? {};
-      if (a.optionId) {
-        onRespond({
-          requestId,
-          decision: 'allow',
-          optionId: a.optionId,
-          ...(a.text ? { text: a.text } : {}),
-        });
-      } else if (a.text) {
-        onRespond({ requestId, decision: 'allow', text: a.text });
-      }
-      return;
-    }
     // 多题：answers 数组 + decision allow
     const answersList = questions.map((qq) => ({
       questionId: qq.id,
@@ -305,7 +459,6 @@ function HitlStepper({
   };
 
   // Esc = cancel（codex：elicitation Esc 不可静默批准）
-  // INPUT-002：deps 补全 — cancel 逻辑进 useCallback，监听依赖 canRespond/requestId/onRespond
   const cancelHitl = useCallback(() => {
     if (!canRespond) return;
     onRespond({ requestId, decision: 'cancel' });
@@ -372,20 +525,17 @@ function HitlStepper({
 
   return (
     <div className="space-y-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
-      {/* 进度：多题才显示 answered/total */}
-      {isMulti && (
-        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-          <span>
-            问题 {index + 1}/{questions.length}
-          </span>
-          <span>
-            已答 {answeredCount}/{questions.length}
-          </span>
-        </div>
-      )}
+      {/* 进度 */}
+      <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+        <span>
+          问题 {index + 1}/{questions.length}
+        </span>
+        <span>
+          已答 {answeredCount}/{questions.length}
+        </span>
+      </div>
       <p className="text-sm text-muted-foreground whitespace-pre-wrap">{q.question}</p>
 
-      {/* 选项 */}
       {q.options && q.options.length > 0 && (
         <div className="flex flex-wrap gap-2">
           {q.options.map((option) => (
@@ -410,7 +560,6 @@ function HitlStepper({
         </div>
       )}
 
-      {/* notes / 自由文本 */}
       {showNotes && (
         <div className="flex flex-col gap-2">
           <textarea
@@ -437,7 +586,7 @@ function HitlStepper({
 
       <div className="flex items-center justify-between gap-2">
         <div className="flex flex-wrap gap-1">
-          {isMulti && index > 0 ? (
+          {index > 0 ? (
             <Button
               type="button"
               size="sm"
@@ -462,7 +611,6 @@ function HitlStepper({
               上一题
             </Button>
           ) : null}
-          {/* 取消：显式 cancel，Esc 同义 */}
           <Button
             type="button"
             size="sm"

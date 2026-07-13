@@ -34,7 +34,8 @@ export function ThinkingMessage({ show }: { show: boolean }) {
       )}
     >
       <p className="text-sm text-muted-foreground">
-        <Shimmer duration={1}>Thinking…</Shimmer>
+        {/* Shimmer 默认渲染为 <p>，作为 <p> 的子节点会触发 HTML 嵌套违规和水合错误；显式改为 <span> */}
+        <Shimmer as="span" duration={1}>Thinking…</Shimmer>
       </p>
     </div>
   );

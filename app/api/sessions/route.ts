@@ -16,6 +16,7 @@ const createSessionSchema = z.object({
 });
 
 export async function POST(request: NextRequest) {
+  // 注：listTargets 依赖 parsed.data.backend 选 adapter，无可并行的纯 IO；保持原顺序
   const parsed = await parseJsonBody(request, createSessionSchema);
   if (!parsed.ok) return parsed.response;
   const { backend, model, targetId, cwd } = parsed.data;
@@ -104,26 +105,26 @@ export async function GET(request: NextRequest) {
   const eveTargetIds = sessionRows
     .filter((s) => s.backend === 'eveagent')
     .map((s) => s.targetId);
-
-  const targetNameById = new Map<string, string>();
-  if (localTargetIds.length > 0) {
-    const deviceRows = await db.select({ id: devices.id, name: devices.name })
-      .from(devices).where(inArray(devices.id, localTargetIds));
-    deviceRows.forEach((d) => targetNameById.set(d.id, d.name));
-  }
-  if (eveTargetIds.length > 0) {
-    const svcRows = await db.select({ id: eveServices.id, name: eveServices.name })
-      .from(eveServices).where(inArray(eveServices.id, eveTargetIds));
-    svcRows.forEach((s) => targetNameById.set(s.id, s.name));
-  }
-
-  // JOIN messages 拿 messageCount(按 sessionId 批量聚合)
   const sessionIds = sessionRows.map((s) => s.id);
-  const countRows = await db
-    .select({ sessionId: messages.sessionId, count: sql<number>`count(*)`.as('count') })
-    .from(messages)
-    .where(inArray(messages.sessionId, sessionIds))
-    .groupBy(messages.sessionId);
+
+  // 三个独立查询(目标名称 + 消息计数)无相互依赖，并行执行缩短列表加载延迟
+  const targetNameById = new Map<string, string>();
+  const [deviceRows, svcRows, countRows] = await Promise.all([
+    localTargetIds.length > 0
+      ? db.select({ id: devices.id, name: devices.name })
+          .from(devices).where(inArray(devices.id, localTargetIds))
+      : Promise.resolve([] as Array<{ id: string; name: string }>),
+    eveTargetIds.length > 0
+      ? db.select({ id: eveServices.id, name: eveServices.name })
+          .from(eveServices).where(inArray(eveServices.id, eveTargetIds))
+      : Promise.resolve([] as Array<{ id: string; name: string }>),
+    db.select({ sessionId: messages.sessionId, count: sql<number>`count(*)`.as('count') })
+      .from(messages)
+      .where(inArray(messages.sessionId, sessionIds))
+      .groupBy(messages.sessionId),
+  ]);
+  deviceRows.forEach((d) => targetNameById.set(d.id, d.name));
+  svcRows.forEach((s) => targetNameById.set(s.id, s.name));
   const countBySessionId = new Map(countRows.map((r) => [r.sessionId, Number(r.count)]));
 
   const result = sessionRows.map((s) => ({

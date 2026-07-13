@@ -112,7 +112,8 @@ export async function GET(
           unsubs.push(unsubscribe);
         }
 
-        // SSE 连接时触发 resume(reload 续接):追回崩溃窗口遗漏事件
+        // SSE 连接时触发 resume（reload 续接）。必须先完成订阅，避免
+        // resume 同步或快速补发事件时监听器尚未建立而丢失事件。
         adapter.resume?.(id, request.signal).catch((err) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[events] resume failed sid=${id}:`, err);

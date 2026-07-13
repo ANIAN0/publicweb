@@ -5,6 +5,8 @@ import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { getActiveSession, getSessionById } from '@/lib/api/get-active-session';
 import { softDeleteSession } from '@/lib/api/soft-delete-session';
+import { getBackendAdapter } from '@/lib/backends/router';
+import { isLocalBackendId } from '@/lib/backends/labels';
 
 export async function GET(
   request: NextRequest,
@@ -22,11 +24,27 @@ export async function GET(
     localSessionRef: _r,
     ...safe
   } = session;
+
+  // D2: local backend 时把 target 的实时 models 一起下发，省掉 chat 页第二次 round-trip
+  // （仅 claudecode/pi 有可换模型；eveagent 单模型绑死无需列表）
+  let availableModels: Array<{ id: string; label: string; isDefault?: boolean }> | undefined;
+  if (session.targetId && isLocalBackendId(session.backend)) {
+    try {
+      const adapter = getBackendAdapter(session.backend);
+      const targets = await adapter.listTargets();
+      const target = targets.find((item) => item.id === session.targetId);
+      availableModels = target?.models;
+    } catch {
+      availableModels = undefined; // 后端不可用时让前端走 fallback（不阻塞 GET）
+    }
+  }
+
   return NextResponse.json({
     ...safe,
     // 仅暴露是否存在，便于 UI/诊断，不回传明文
     hasEveContinuationToken: Boolean(session.eveContinuationToken),
     hasLocalSessionRef: Boolean(session.localSessionRef),
+    ...(availableModels ? { availableModels } : {}),
   });
 }
 

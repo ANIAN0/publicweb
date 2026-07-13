@@ -3,7 +3,7 @@
 // 设计参考:open-agents 的 session-list(按日期分组、极简语义色、hover 高亮)+ tool sidebar(hover 才显操作)
 // 数据:GET /api/sessions(filter: backend / q);操作:PATCH /api/sessions/[id](userTitle)、DELETE(软删)、POST bulk-delete
 import Link from 'next/link';
-import { useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus,
   Settings,
@@ -96,9 +96,13 @@ export default function Home() {
     return () => clearTimeout(t);
   }, [qInput]);
 
-  // 拉数据:backend 或 q 变化时重新请求
-  const reload = () => {
+  // A2: reload 改用 useCallback 稳定引用；AbortController 用 ref 持有以便 cleanup 触发最新请求的 abort
+  // 旧实现 reload 是 inline 闭包，每次渲染新引用 → useEffect(reload, [backend, q]) 实际每次 render 都重跑
+  const abortRef = useRef<AbortController | null>(null);
+  const reload = useCallback(() => {
+    abortRef.current?.abort();
     const ac = new AbortController();
+    abortRef.current = ac;
     const params = new URLSearchParams();
     if (backend) params.set('backend', backend);
     if (q) params.set('q', q);
@@ -107,6 +111,8 @@ export default function Home() {
     fetch(`/api/sessions?${params.toString()}`, { signal: ac.signal })
       .then((r) => r.json() as Promise<SessionItem[]>)
       .then((data) => {
+        // 已被 abort（用户在请求未返回时切换 backend/q）则丢弃结果
+        if (abortRef.current !== ac) return;
         setItems(data);
         // 刷新后剔除已不在列表中的选中（含刚删除的）
         const alive = new Set(data.map((s) => s.id));
@@ -119,13 +125,21 @@ export default function Home() {
         });
       })
       .catch((err) => {
-        // AbortError 是组件卸载/筛选切换触发的正常取消,不算错误
-        if (err.name !== 'AbortError') setError('加载会话失败,请重试');
+        if (err.name === 'AbortError') return; // 主动取消，非错误
+        if (abortRef.current !== ac) return;
+        setError('加载会话失败,请重试');
       })
-      .finally(() => setLoading(false));
-    return () => ac.abort();
-  };
-  useEffect(reload, [backend, q]);
+      .finally(() => {
+        if (abortRef.current === ac) setLoading(false);
+      });
+  }, [backend, q]);
+
+  useEffect(() => {
+    reload();
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, [reload]);
 
   const groups = groupByDate(items);
   const visibleIds = useMemo(() => items.map((s) => s.id), [items]);
@@ -133,24 +147,24 @@ export default function Home() {
   const allVisibleSelected =
     visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
 
-  const toggleOne = (id: string, checked: boolean) => {
+  const toggleOne = useCallback((id: string, checked: boolean) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
       if (checked) next.add(id);
       else next.delete(id);
       return next;
     });
-  };
+  }, []);
 
-  const selectAllVisible = () => {
+  const selectAllVisible = useCallback(() => {
     setSelectedIds(new Set(visibleIds));
-  };
+  }, [visibleIds]);
 
-  const clearSelection = () => {
+  const clearSelection = useCallback(() => {
     setSelectedIds(new Set());
-  };
+  }, []);
 
-  const invertSelection = () => {
+  const invertSelection = useCallback(() => {
     setSelectedIds((prev) => {
       const next = new Set<string>();
       for (const id of visibleIds) {
@@ -158,7 +172,7 @@ export default function Home() {
       }
       return next;
     });
-  };
+  }, [visibleIds]);
 
   const confirmBulkDeleteAction = async () => {
     if (selectedCount === 0) return;
@@ -333,7 +347,7 @@ export default function Home() {
                       item={s}
                       onChanged={reload}
                       selected={selectedIds.has(s.id)}
-                      onSelectedChange={(checked) => toggleOne(s.id, checked)}
+                      onSelectedChange={toggleOne}
                     />
                   ))}
                 </div>
@@ -357,7 +371,10 @@ export default function Home() {
 }
 
 // 单条会话行:多选 Checkbox + hover 高亮、点击进会话、⋯ 菜单(重命名/删除)、删除二次确认
-function SessionRow({
+// A3: 用 React.memo 包裹；父组件 onChanged 由 useCallback 稳定（A2），item 仅在该行变更时换引用，
+// selected 来自父组件 selectedIds.has(id)；onSelectedChange 接受 (id, checked) 直接绑定父级 toggleOne
+// → 避免父组件 .map 内 inline arrow 让 memo 失效
+const SessionRow = memo(function SessionRow({
   item,
   onChanged,
   selected,
@@ -366,7 +383,7 @@ function SessionRow({
   item: SessionItem;
   onChanged: () => void;
   selected: boolean;
-  onSelectedChange: (checked: boolean) => void;
+  onSelectedChange: (id: string, checked: boolean) => void;
 }) {
   // 显示优先级:userTitle > title > "新会话"
   const displayTitle = item.userTitle ?? item.title ?? '新会话';
@@ -426,7 +443,7 @@ function SessionRow({
         >
           <Checkbox
             checked={selected}
-            onCheckedChange={onSelectedChange}
+            onCheckedChange={(checked) => onSelectedChange(item.id, checked === true)}
             aria-label={`选择 ${displayTitle}`}
           />
         </div>
@@ -546,4 +563,4 @@ function SessionRow({
       />
     </>
   );
-}
+});

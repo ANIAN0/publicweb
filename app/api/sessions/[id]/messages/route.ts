@@ -104,10 +104,14 @@ export async function POST(
     );
   }
 
-  // 校验附件已落盘，补全 url
+  // 校验附件已落盘，补全 url；多个附件并行 read（每附件独立 disk read，无相互依赖）
+  const attachmentBufs = await Promise.all(
+    attachments.map((a) => readAttachmentBuffer(id, a.id)),
+  );
   const resolved: MessageAttachmentRef[] = [];
-  for (const a of attachments) {
-    const buf = await readAttachmentBuffer(id, a.id);
+  for (let i = 0; i < attachments.length; i++) {
+    const a = attachments[i];
+    const buf = attachmentBufs[i];
     if (!buf) {
       return NextResponse.json({ error: `attachment not found: ${a.id}` }, { status: 400 });
     }

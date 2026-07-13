@@ -63,6 +63,7 @@ Desktop.ini
 .idea/
 *.swp
 *.swo
+/.claude/settings.local.json
 
 # 日志文件
 *.log

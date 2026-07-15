@@ -6,11 +6,18 @@ import { eq } from 'drizzle-orm';
 import { debugLog } from '@/lib/debug-log';
 import { getActiveSession } from '@/lib/api/get-active-session';
 import { releaseTurnLock } from '@/lib/backends/turn-lock';
+import { sendToDevice } from '@/server/ws/device-connections';
 
 export type SoftDeleteResult = 'deleted' | 'skipped';
 
 /**
  * 软删未删除会话。不存在或已删 → skipped（调用方映射 404 / bulk skipped）。
+ *
+ * 注意：禁止在此路径调用 adapter.stop()。
+ * local.stop 会 re-bind + emit abort → persist 按 DEF-002 新建 interrupted assistant；
+ * 批量删除时每条都落库，请求极慢，Next 首次编译时终端会长时间停在
+ * 「○ Compiling /api/sessions/bulk-delete ...」。
+ * 销毁会话只应 releaseRuntime；local 设备用 session.stop 尽力通知 client，不写服务端终态消息。
  */
 export async function softDeleteSession(id: string): Promise<SoftDeleteResult> {
   const session = await getActiveSession(id);
@@ -25,10 +32,18 @@ export async function softDeleteSession(id: string): Promise<SoftDeleteResult> {
     const { getBackendAdapter } = await import('@/lib/backends/router');
     const adapter = getBackendAdapter(session.backend) as {
       releaseRuntime?: (sid: string) => void;
-      stop?: (sid: string) => Promise<void>;
     };
+
+    // eveagent.releaseRuntime 内部已 abort 进行中的 turn
     adapter.releaseRuntime?.(id);
-    await adapter.stop?.(id);
+
+    // local：映射已清，按 targetId 尽力下发 stop（无 throw、不写 abort 终态）
+    if (
+      (session.backend === 'claudecode' || session.backend === 'pi') &&
+      session.targetId
+    ) {
+      sendToDevice(session.targetId, { type: 'session.stop', sessionId: id });
+    }
   } catch (err) {
     debugLog(
       'app',

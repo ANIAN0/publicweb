@@ -262,50 +262,65 @@ export default function Home() {
           </div>
         </div>
 
-        {/* 多选工具条：有列表时显示；选中后强调删除 */}
+        {/* 多选：未选时只留轻量全选；有选中时整行操作条（左信息/右删除） */}
         {!loading && !error && items.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            <Checkbox
-              checked={allVisibleSelected}
-              onCheckedChange={(c) => {
-                if (c) selectAllVisible();
-                else clearSelection();
-              }}
-              aria-label="全选当前列表"
-            />
-            <Button variant="ghost" size="sm" onClick={selectAllVisible}>
-              全选
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={invertSelection}
-              disabled={visibleIds.length === 0}
-            >
-              反选
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={clearSelection}
-              disabled={selectedCount === 0}
-            >
-              取消选中
-            </Button>
-            <span className="text-muted-foreground">
-              已选 {selectedCount}
-              {visibleIds.length > 0 ? ` / ${visibleIds.length}` : ''}
-            </span>
-            <Button
-              variant="destructive"
-              size="sm"
-              disabled={selectedCount === 0 || bulkBusy}
-              onClick={() => setConfirmBulkDelete(true)}
-            >
-              <Trash2 className="size-4" />
-              删除选中 ({selectedCount})
-            </Button>
-          </div>
+          selectedCount === 0 ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Checkbox
+                checked={false}
+                onCheckedChange={(c) => {
+                  if (c) selectAllVisible();
+                }}
+                aria-label="全选当前列表"
+              />
+              <button
+                type="button"
+                className="hover:text-foreground"
+                onClick={selectAllVisible}
+              >
+                全选本页（{visibleIds.length}）
+              </button>
+              <span className="text-xs">勾选左侧可批量删除</span>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/20 bg-destructive/5 px-3 py-2 text-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <Checkbox
+                  checked={allVisibleSelected}
+                  onCheckedChange={(c) => {
+                    if (c) selectAllVisible();
+                    else clearSelection();
+                  }}
+                  aria-label="全选当前列表"
+                />
+                <span className="font-medium tabular-nums">
+                  已选 {selectedCount}
+                  <span className="font-normal text-muted-foreground">
+                    {' '}/ {visibleIds.length}
+                  </span>
+                </span>
+                <span className="text-muted-foreground">·</span>
+                <Button variant="ghost" size="sm" className="h-7 px-2" onClick={selectAllVisible}>
+                  全选
+                </Button>
+                <Button variant="ghost" size="sm" className="h-7 px-2" onClick={invertSelection}>
+                  反选
+                </Button>
+                <Button variant="ghost" size="sm" className="h-7 px-2" onClick={clearSelection}>
+                  取消
+                </Button>
+              </div>
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={bulkBusy}
+                onClick={() => setConfirmBulkDelete(true)}
+              >
+                <Trash2 className="size-4" />
+                删除选中（{selectedCount}）
+              </Button>
+            </div>
+          )
         )}
       </div>
 
@@ -434,10 +449,14 @@ const SessionRow = memo(function SessionRow({
 
   return (
     <>
-      <div className="group flex items-center justify-between gap-3 rounded-lg px-3 py-2.5 transition-colors hover:bg-muted/50">
-        {/* 多选：阻止冒泡，避免点选跳进会话 */}
+      <div
+        className={`group grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 rounded-lg px-2 py-2.5 transition-colors hover:bg-muted/50 ${
+          selected ? 'bg-muted/40' : ''
+        }`}
+      >
+        {/* 多选：阻止冒泡，避免点选跳进会话；与标题行垂直居中对齐 */}
         <div
-          className="flex shrink-0 items-center"
+          className="flex shrink-0 items-center self-center pl-1"
           onClick={(e) => e.stopPropagation()}
           onKeyDown={(e) => e.stopPropagation()}
         >
@@ -448,7 +467,7 @@ const SessionRow = memo(function SessionRow({
           />
         </div>
 
-        <Link href={`/sessions/${item.id}`} className="min-w-0 flex-1">
+        <Link href={`/sessions/${item.id}`} className="min-w-0">
           {renaming ? (
             // 重命名态:inline 输入框 + 保存/取消,Enter 提交 Esc 取消
             <div
@@ -485,8 +504,8 @@ const SessionRow = memo(function SessionRow({
               </Button>
             </div>
           ) : (
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
+            <div className="min-w-0">
+              <div className="flex min-w-0 items-center gap-2">
                 <p className="truncate font-medium text-foreground">
                   {displayTitle}
                 </p>
@@ -497,7 +516,7 @@ const SessionRow = memo(function SessionRow({
               {/* 元信息:设备 · 消息数 · 相对时间 */}
               <p className="mt-0.5 truncate text-xs text-muted-foreground">
                 {item.targetDeleted ? (
-                  // target 已删:显示灰色 Badge（按 backend 区分文案），保留历史会话可一键清理
+                  // target 已删:显示灰色 Badge（按 backend 区分文案）
                   <Badge variant="secondary" className="mr-1.5 text-xs">
                     {item.backend === 'eveagent' ? '已删除服务' : '已删除设备'}
                   </Badge>
@@ -512,11 +531,16 @@ const SessionRow = memo(function SessionRow({
           )}
         </Link>
 
-        {/* ⋯ 菜单:仅非重命名态显示。Trigger 用 buttonVariants 渲染为 ghost 图标按钮 */}
+        {/* ⋯ 菜单：单条重命名 / 删除（target 已删时文案为「清理」） */}
         {!renaming && (
           <DropdownMenu>
             <DropdownMenuTrigger
-              className={buttonVariants({ variant: 'ghost', size: 'icon-sm', className: 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100' })}
+              className={buttonVariants({
+                variant: 'ghost',
+                size: 'icon-sm',
+                className:
+                  'opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100',
+              })}
             >
               <MoreHorizontal className="size-4" />
             </DropdownMenuTrigger>
@@ -524,25 +548,21 @@ const SessionRow = memo(function SessionRow({
               <DropdownMenuItem onClick={() => setRenaming(true)}>
                 <Pencil className="size-4" /> 重命名
               </DropdownMenuItem>
-              {/* 清理项:仅 targetDeleted 时显示，并单独加分割线（避免双分割线） */}
-              {item.targetDeleted && (
-                <>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    className="text-muted-foreground focus:bg-muted"
-                    onClick={() => setConfirmDelete(true)}
-                  >
-                    <Eraser className="size-4" /> 清理
-                  </DropdownMenuItem>
-                </>
-              )}
               <DropdownMenuSeparator />
-              {/* 删除项:红色文字 + hover 红底 */}
+              {/* target 已删：清理；否则删除。同一入口，避免菜单里两项并存 */}
               <DropdownMenuItem
                 className="text-destructive focus:bg-destructive/10 focus:text-destructive"
                 onClick={() => setConfirmDelete(true)}
               >
-                <Trash2 className="size-4" /> 删除
+                {item.targetDeleted ? (
+                  <>
+                    <Eraser className="size-4" /> 清理
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="size-4" /> 删除
+                  </>
+                )}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
